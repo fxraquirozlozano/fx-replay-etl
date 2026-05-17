@@ -12,7 +12,7 @@ app = CloudRunApp()
 
 
 @app.job(
-    "tracking-events-chargebee-export",
+    "upload-weekly-usage-events-to-chargebee",
     schedule="0 8 * * 2",
     timezone="UTC",
     source_dir="data-engineering/cloud-run-jobs/upload-weekly-usage-events-to-chargebee",
@@ -34,7 +34,7 @@ app = CloudRunApp()
         "SFTP_PRIVATE_KEY": "chargebee-sftp-private-key",
     },
 )
-def tracking_events_chargebee_export(event=None):
+def upload_weekly_usage_events_to_chargebee(event=None):
     """Export weekly Chargebee usage data to GCS and then upload it to SFTP."""
     return event
 
