@@ -3,7 +3,7 @@ import json
 import os
 import stat
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from fnmatch import fnmatch
 from io import StringIO
@@ -16,6 +16,8 @@ import paramiko
 PROJECT_ID = os.getenv("GCP_PROJECT", "fxr-analytics")
 DATASET = os.getenv("BQ_DATASET", "chargebee")
 TABLE = os.getenv("BQ_TABLE", "chargebee_predictions")
+RAW_BQ_DATASET = os.getenv("RAW_BQ_DATASET", "chargebee_raw")
+RAW_BQ_TABLE = os.getenv("RAW_BQ_TABLE", "chargebee_predictions")
 RAW_BUCKET = os.getenv("RAW_BUCKET", "fxr-chargebee-exports")
 RAW_PREFIX = os.getenv("RAW_PREFIX", "chargebee_predictions_raw").strip("/")
 SFTP_HOST = os.getenv("SFTP_HOST", "").strip()
@@ -205,6 +207,15 @@ def parse_schema(schema_path: Path) -> list[bigquery.SchemaField]:
     return schema
 
 
+def raw_table_schema(schema: list[bigquery.SchemaField]) -> list[bigquery.SchemaField]:
+    return [
+        bigquery.SchemaField("batch_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("source_file_name", "STRING"),
+        bigquery.SchemaField("loaded_at", "TIMESTAMP", mode="REQUIRED"),
+        *schema,
+    ]
+
+
 def normalize_value(raw_value: str, field: bigquery.SchemaField) -> str:
     if raw_value == "":
         return raw_value
@@ -224,8 +235,11 @@ def normalize_csv_for_bigquery(
     source_path: Path,
     destination_path: Path,
     schema: list[bigquery.SchemaField],
+    batch_id: str,
 ) -> None:
     schema_by_name = {field.name: field for field in schema}
+    output_fieldnames = ["batch_id", "source_file_name", "loaded_at", *[field.name for field in schema]]
+    loaded_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
     with source_path.open("r", encoding="utf-8-sig", newline="") as source_handle:
         reader = csv.DictReader(source_handle)
@@ -233,31 +247,128 @@ def normalize_csv_for_bigquery(
             raise ValueError(f"CSV file is empty: {source_path}")
 
         with destination_path.open("w", encoding="utf-8", newline="") as destination_handle:
-            writer = csv.DictWriter(destination_handle, fieldnames=reader.fieldnames)
+            writer = csv.DictWriter(destination_handle, fieldnames=output_fieldnames)
             writer.writeheader()
 
             for row in reader:
-                normalized_row = {}
-                for column_name in reader.fieldnames:
+                normalized_row = {
+                    "batch_id": batch_id,
+                    "source_file_name": source_path.name,
+                    "loaded_at": loaded_at,
+                }
+                for column_name in [field.name for field in schema]:
                     field = schema_by_name.get(column_name)
                     value = row.get(column_name, "")
                     normalized_row[column_name] = normalize_value(value, field) if field else value
                 writer.writerow(normalized_row)
 
 
-def load_predictions(csv_paths: list[Path], schema: list[bigquery.SchemaField]) -> None:
-    client = bigquery.Client(project=PROJECT_ID)
-    table_ref = f"{PROJECT_ID}.{DATASET}.{TABLE}"
+def sanitize_identifier(value: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in value)
+
+
+def ensure_dataset(client: bigquery.Client, dataset_id: str) -> None:
+    dataset_ref = f"{PROJECT_ID}.{dataset_id}"
+    try:
+        client.get_dataset(dataset_ref)
+    except Exception:
+        client.create_dataset(bigquery.Dataset(dataset_ref), exists_ok=True)
+
+
+def ensure_table(
+    client: bigquery.Client,
+    dataset_id: str,
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    table_ref = f"{PROJECT_ID}.{dataset_id}.{table_id}"
+    ensure_dataset(client, dataset_id)
+    try:
+        client.get_table(table_ref)
+    except Exception:
+        client.create_table(bigquery.Table(table_ref, schema=schema))
+
+
+def load_into_table(
+    client: bigquery.Client,
+    csv_paths: list[Path],
+    table_ref: str,
+    schema: list[bigquery.SchemaField],
+    write_disposition: str,
+) -> None:
     for index, csv_path in enumerate(csv_paths):
-        write_disposition = WRITE_DISPOSITION if index == 0 else "WRITE_APPEND"
+        effective_write_disposition = write_disposition if index == 0 else "WRITE_APPEND"
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.CSV,
             skip_leading_rows=1,
-            write_disposition=write_disposition,
+            write_disposition=effective_write_disposition,
             schema=schema,
         )
         with csv_path.open("rb") as handle:
             client.load_table_from_file(handle, table_ref, job_config=job_config).result()
+
+
+def merge_raw_table(
+    client: bigquery.Client,
+    temp_table_ref: str,
+    raw_table_ref: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    column_names = ["batch_id", "source_file_name", "loaded_at", *[field.name for field in schema]]
+    insert_columns = ", ".join(column_names)
+    insert_values = ", ".join(f"src.{column}" for column in column_names)
+    sql = f"""
+    MERGE `{raw_table_ref}` AS target
+    USING `{temp_table_ref}` AS src
+    ON target.batch_id = src.batch_id
+       AND target.unique_id = src.unique_id
+    WHEN NOT MATCHED THEN
+      INSERT ({insert_columns})
+      VALUES ({insert_values})
+    """
+    client.query(sql).result()
+
+
+def merge_final_table(
+    client: bigquery.Client,
+    temp_table_ref: str,
+    final_table_ref: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    column_names = [field.name for field in schema]
+    insert_columns = ", ".join(column_names)
+    insert_values = ", ".join(f"src.{column}" for column in column_names)
+    sql = f"""
+    MERGE `{final_table_ref}` AS target
+    USING `{temp_table_ref}` AS src
+    ON target.unique_id = src.unique_id
+    WHEN NOT MATCHED THEN
+      INSERT ({insert_columns})
+      VALUES ({insert_values})
+    """
+    client.query(sql).result()
+
+
+def load_predictions(batch_id: str, csv_paths: list[Path], schema: list[bigquery.SchemaField]) -> None:
+    client = bigquery.Client(project=PROJECT_ID)
+    final_table_ref = f"{PROJECT_ID}.{DATASET}.{TABLE}"
+    raw_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{RAW_BQ_TABLE}"
+    temp_table_ref = (
+        f"{PROJECT_ID}.{RAW_BQ_DATASET}."
+        f"_tmp_{sanitize_identifier(RAW_BQ_TABLE)}_{sanitize_identifier(batch_id)}"
+    )
+    raw_schema = raw_table_schema(schema)
+    final_schema = schema
+
+    ensure_table(client, RAW_BQ_DATASET, RAW_BQ_TABLE, raw_schema)
+    ensure_table(client, DATASET, TABLE, final_schema)
+
+    try:
+        load_into_table(client, csv_paths, temp_table_ref, raw_schema, "WRITE_TRUNCATE")
+        merge_raw_table(client, temp_table_ref, raw_table_ref, schema)
+        merge_final_table(client, temp_table_ref, final_table_ref, schema)
+    finally:
+        client.delete_table(temp_table_ref, not_found_ok=True)
 
 
 def read_metadata(metadata_path: Path) -> dict:
@@ -282,16 +393,22 @@ def main() -> None:
             normalized_csv_paths: list[Path] = []
             for csv_filename in csv_filenames:
                 normalized_path = Path(tmp_dir) / f"normalized-{csv_filename}"
-                normalize_csv_for_bigquery(local_files[csv_filename], normalized_path, schema)
+                normalize_csv_for_bigquery(
+                    local_files[csv_filename],
+                    normalized_path,
+                    schema,
+                    batch_id,
+                )
                 normalized_csv_paths.append(normalized_path)
 
-            load_predictions(normalized_csv_paths, schema)
+            load_predictions(batch_id, normalized_csv_paths, schema)
 
         print(
             "Predictions batch loaded",
             {
                 "project": PROJECT_ID,
                 "table": f"{PROJECT_ID}.{DATASET}.{TABLE}",
+                "raw_table": f"{PROJECT_ID}.{RAW_BQ_DATASET}.{RAW_BQ_TABLE}",
                 "batch_path": batch_path,
                 "batch_id": batch_id,
                 "raw_bucket": RAW_BUCKET,

@@ -48,6 +48,8 @@ def upload_weekly_usage_events_to_chargebee(event=None):
         "GCP_PROJECT": PROJECT_ID,
         "BQ_DATASET": "chargebee",
         "BQ_TABLE": "chargebee_predictions",
+        "RAW_BQ_DATASET": "chargebee_raw",
+        "RAW_BQ_TABLE": "chargebee_predictions",
         "RAW_BUCKET": "fxr-chargebee-exports",
         "RAW_PREFIX": "chargebee_predictions_raw",
         "SFTP_PORT": "22",
