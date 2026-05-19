@@ -25,17 +25,44 @@ app = CloudRunApp()
         "EXPORT_FORMAT": "CSV",
         "EXPORT_COMPRESSION": "GZIP",
         "EXPORT_TIME_ZONE": "UTC",
-        "SFTP_HOST": "data-accel.chargebee.com",
         "SFTP_PORT": "22",
-        "SFTP_USER": "cb-prod-fxreplay-fileshare",
         "SFTP_REMOTE_PATH": "usage_data",
     },
     secret_env_vars={
+        "SFTP_HOST": "chargebee-sftp-host-runtime",
+        "SFTP_USER": "chargebee-sftp-user-runtime",
         "SFTP_PRIVATE_KEY": "chargebee-sftp-private-key",
     },
 )
 def upload_weekly_usage_events_to_chargebee(event=None):
     """Export weekly Chargebee usage data to GCS and then upload it to SFTP."""
+    return event
+
+
+@app.job(
+    "load-weekly-chargebee-predictions-from-sftp",
+    schedule="0 17 * * 3",
+    timezone="UTC",
+    source_dir="data-engineering/cloud-run-jobs/load-weekly-chargebee-predictions-from-sftp",
+    env_vars={
+        "GCP_PROJECT": PROJECT_ID,
+        "BQ_DATASET": "chargebee",
+        "BQ_TABLE": "chargebee_predictions",
+        "RAW_BUCKET": "fxr-chargebee-exports",
+        "RAW_PREFIX": "chargebee_predictions_raw",
+        "SFTP_PORT": "22",
+        "SFTP_ROOT_PATH": "/predictions",
+        "SFTP_FILE_GLOB": "predictions_part_*.csv",
+        "WRITE_DISPOSITION": "WRITE_APPEND",
+    },
+    secret_env_vars={
+        "SFTP_HOST": "chargebee-sftp-host-runtime",
+        "SFTP_USER": "chargebee-sftp-user-runtime",
+        "SFTP_PRIVATE_KEY": "chargebee-sftp-private-key",
+    },
+)
+def load_weekly_chargebee_predictions_from_sftp(event=None):
+    """Fetch the latest Chargebee predictions batch from SFTP and load it into BigQuery."""
     return event
 
 

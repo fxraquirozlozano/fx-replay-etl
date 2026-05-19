@@ -16,11 +16,11 @@ PREFIX = os.getenv("EXPORT_PREFIX", "tracking_events_chargebee")
 EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "CSV").upper()
 COMPRESSION = os.getenv("EXPORT_COMPRESSION", "GZIP").upper()
 EXPORT_TIME_ZONE = os.getenv("EXPORT_TIME_ZONE", "America/Chicago")
-SFTP_HOST = os.getenv("SFTP_HOST", "")
+SFTP_HOST = os.getenv("SFTP_HOST", "").strip()
 SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
-SFTP_USER = os.getenv("SFTP_USER", "")
+SFTP_USER = os.getenv("SFTP_USER", "").strip()
 SFTP_REMOTE_PATH = os.getenv("SFTP_REMOTE_PATH", "usage_data")
-SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "")
+SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "").strip()
 EXPORT_COLUMNS = [
     "subscription_id",
     "subscription_plan",
