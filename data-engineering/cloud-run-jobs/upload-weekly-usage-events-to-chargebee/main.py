@@ -1,5 +1,9 @@
 import os
-from io import BytesIO, StringIO
+import csv
+import gzip
+import json
+import tempfile
+from io import BytesIO, StringIO, TextIOWrapper
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -21,6 +25,8 @@ SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
 SFTP_USER = os.getenv("SFTP_USER", "").strip()
 SFTP_REMOTE_PATH = os.getenv("SFTP_REMOTE_PATH", "usage_data")
 SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "").strip()
+SFTP_BATCH_TIME_ZONE = os.getenv("SFTP_BATCH_TIME_ZONE", "UTC").strip()
+ROWS_PER_OUTPUT_FILE = int(os.getenv("ROWS_PER_OUTPUT_FILE", "250000"))
 EXPORT_COLUMNS = [
     "subscription_id",
     "subscription_plan",
@@ -158,6 +164,122 @@ def upload_exports_to_sftp(destination_uri: str) -> list[str]:
     return uploaded_files
 
 
+def batch_id() -> str:
+    return datetime.now(ZoneInfo(SFTP_BATCH_TIME_ZONE)).strftime("%Y-%m-%d-%H-%M-%S")
+
+
+def iter_export_rows(blobs: list[storage.Blob]):
+    for blob in sorted(blobs, key=lambda item: item.name):
+        if blob.name.endswith("/"):
+            continue
+
+        buffer = BytesIO()
+        blob.download_to_file(buffer)
+        buffer.seek(0)
+
+        stream = gzip.GzipFile(fileobj=buffer, mode="rb") if blob.name.endswith(".gz") else buffer
+        text_stream = TextIOWrapper(stream, encoding="utf-8", newline="")
+        reader = csv.reader(text_stream)
+
+        try:
+            header = next(reader, None)
+            if header is None:
+                continue
+
+            for row in reader:
+                if any(cell not in ("", None) for cell in row):
+                    yield row
+        finally:
+            text_stream.detach()
+            if hasattr(stream, "close"):
+                stream.close()
+
+
+def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedTemporaryFile], dict]:
+    bucket_prefix = destination_uri.removeprefix("gs://")
+    bucket_name, blob_pattern = bucket_prefix.split("/", 1)
+    blob_prefix = blob_pattern.rsplit("/", 1)[0] + "/"
+    blobs = list_exported_blobs(bucket_name, blob_prefix)
+
+    current_batch_id = batch_id()
+    output_files: list[tempfile.NamedTemporaryFile] = []
+    expected_file_names: list[str] = []
+    current_file = None
+    current_writer = None
+    current_row_count = 0
+    part_number = 0
+
+    def open_next_part():
+        nonlocal current_file, current_writer, current_row_count, part_number
+        if current_file is not None:
+            current_file.flush()
+            current_file.seek(0)
+            output_files.append(current_file)
+
+        part_number += 1
+        file_name = f"usage_events_part_{part_number:03d}.csv"
+        expected_file_names.append(file_name)
+        current_file = tempfile.NamedTemporaryFile(mode="w+", newline="", suffix=".csv", delete=False)
+        current_writer = csv.writer(current_file)
+        current_writer.writerow(EXPORT_COLUMNS)
+        current_row_count = 0
+
+    for row in iter_export_rows(blobs):
+        if current_file is None or current_row_count >= ROWS_PER_OUTPUT_FILE:
+            open_next_part()
+        current_writer.writerow(row)
+        current_row_count += 1
+
+    if current_file is not None:
+        current_file.flush()
+        current_file.seek(0)
+        output_files.append(current_file)
+
+    metadata = {
+        "batch_id": current_batch_id,
+        "expected_file_count": len(expected_file_names),
+        "expected_file_names": expected_file_names,
+    }
+    return current_batch_id, output_files, metadata
+
+
+def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
+    if not sftp_enabled():
+        raise RuntimeError(
+            "SFTP upload is not configured. Set SFTP_HOST, SFTP_USER, and "
+            "SFTP_PRIVATE_KEY."
+        )
+
+    current_batch_id, part_files, metadata = prepare_batch_files(destination_uri)
+    remote_batch_path = f"{SFTP_REMOTE_PATH.rstrip('/')}/{current_batch_id}"
+    uploaded_files: list[str] = []
+    sftp, transport = sftp_client()
+
+    try:
+        ensure_remote_dir(sftp, remote_batch_path)
+
+        for part_file, file_name in zip(part_files, metadata["expected_file_names"]):
+            part_file.seek(0)
+            remote_file = f"{remote_batch_path}/{file_name}"
+            sftp.putfo(part_file, remote_file)
+            uploaded_files.append(remote_file)
+
+        metadata_bytes = BytesIO(json.dumps(metadata, indent=2).encode("utf-8"))
+        metadata_remote_file = f"{remote_batch_path}/metadata.json"
+        sftp.putfo(metadata_bytes, metadata_remote_file)
+        uploaded_files.append(metadata_remote_file)
+    finally:
+        for part_file in part_files:
+            file_name = part_file.name
+            part_file.close()
+            if os.path.exists(file_name):
+                os.unlink(file_name)
+        sftp.close()
+        transport.close()
+
+    return uploaded_files, metadata
+
+
 def main() -> None:
     start_date, end_date = weekly_window()
     destination_uri = build_destination_uri(start_date, end_date)
@@ -166,7 +288,7 @@ def main() -> None:
     client = bigquery.Client(project=PROJECT_ID)
     job = client.query(sql)
     job.result()
-    uploaded_files = upload_exports_to_sftp(destination_uri)
+    uploaded_files, metadata = upload_batch_to_sftp(destination_uri)
 
     print(
         "Export completed",
@@ -181,6 +303,8 @@ def main() -> None:
             "sftp_host": SFTP_HOST,
             "sftp_remote_path": SFTP_REMOTE_PATH,
             "uploaded_files": len(uploaded_files),
+            "batch_id": metadata["batch_id"],
+            "expected_file_count": metadata["expected_file_count"],
         },
     )
 

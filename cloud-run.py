@@ -12,6 +12,27 @@ app = CloudRunApp()
 
 
 @app.job(
+    "refresh-daily-tracking-events-chargebee",
+    schedule="0 8 * * *",
+    timezone="America/Chicago",
+    source_dir="data-engineering/cloud-run-jobs/refresh-daily-tracking-events-chargebee",
+    env_vars={
+        "GCP_PROJECT": PROJECT_ID,
+        "SOURCE_DATASET": "reporting",
+        "SOURCE_TABLE": "tracking_events",
+        "USERS_DATASET": "dbt_cloud",
+        "USERS_TABLE": "dim_user",
+        "TARGET_DATASET": "sandbox",
+        "TARGET_TABLE": "tracking_events_chargebee",
+        "PROCESS_TIME_ZONE": "America/Chicago",
+    },
+)
+def refresh_daily_tracking_events_chargebee(event=None):
+    """Incrementally refresh the previous day's Chargebee tracking events table."""
+    return event
+
+
+@app.job(
     "upload-weekly-usage-events-to-chargebee",
     schedule="0 8 * * 2",
     timezone="UTC",
@@ -25,8 +46,10 @@ app = CloudRunApp()
         "EXPORT_FORMAT": "CSV",
         "EXPORT_COMPRESSION": "GZIP",
         "EXPORT_TIME_ZONE": "UTC",
+        "SFTP_BATCH_TIME_ZONE": "UTC",
         "SFTP_PORT": "22",
         "SFTP_REMOTE_PATH": "usage_data",
+        "ROWS_PER_OUTPUT_FILE": "250000",
     },
     secret_env_vars={
         "SFTP_HOST": "chargebee-sftp-host-runtime",

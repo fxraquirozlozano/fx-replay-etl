@@ -8,8 +8,12 @@ from typing import Any
 
 import requests
 from airflow import DAG
-from airflow.decorators import get_current_context, task
+from airflow.decorators import task
 from airflow.models import Variable
+try:
+    from airflow.operators.python import get_current_context
+except ImportError:
+    from airflow.decorators import get_current_context
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
