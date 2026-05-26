@@ -20,6 +20,8 @@ PREFIX = os.getenv("EXPORT_PREFIX", "tracking_events_chargebee")
 EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "CSV").upper()
 COMPRESSION = os.getenv("EXPORT_COMPRESSION", "GZIP").upper()
 EXPORT_TIME_ZONE = os.getenv("EXPORT_TIME_ZONE", "America/Chicago")
+EXPORT_START_DATE = os.getenv("EXPORT_START_DATE", "").strip()
+EXPORT_END_DATE = os.getenv("EXPORT_END_DATE", "").strip()
 SFTP_HOST = os.getenv("SFTP_HOST", "").strip()
 SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
 SFTP_USER = os.getenv("SFTP_USER", "").strip()
@@ -62,6 +64,12 @@ def weekly_window() -> tuple[str, str]:
     end_date = local_now.date() - timedelta(days=(local_now.weekday() - 1) % 7)
     start_date = end_date - timedelta(days=7)
     return start_date.isoformat(), end_date.isoformat()
+
+
+def export_window() -> tuple[str, str]:
+    if EXPORT_START_DATE and EXPORT_END_DATE:
+        return EXPORT_START_DATE, EXPORT_END_DATE
+    return weekly_window()
 
 
 def build_destination_uri(start_date: str, end_date: str) -> str:
@@ -304,7 +312,7 @@ def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
 
 
 def main() -> None:
-    start_date, end_date = weekly_window()
+    start_date, end_date = export_window()
     destination_uri = build_destination_uri(start_date, end_date)
     sql = build_export_sql(destination_uri, start_date, end_date)
 
