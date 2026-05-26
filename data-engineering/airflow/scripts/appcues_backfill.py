@@ -1,25 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
 import os
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import requests
-from airflow import DAG
-try:
-    from airflow.sdk import Variable, get_current_context, task
-except ImportError:
-    from airflow.decorators import task
-    from airflow.models import Variable
-    try:
-        from airflow.operators.python import get_current_context
-    except ImportError:
-        from airflow.decorators import get_current_context
 from google.api_core.exceptions import BadRequest, NotFound, PermissionDenied
 from google.cloud import bigquery
 from google.cloud import secretmanager
@@ -28,41 +20,6 @@ from requests.auth import HTTPBasicAuth
 
 APPCUES_API_BASE_URL = "https://api.appcues.com/v2"
 APPCUES_EVENT_NAME = "appcues:v2:step_interaction"
-STREAM_NAME = "nps_events"
-
-
-def airflow_var(name: str, default: str) -> str:
-    env_value = os.getenv(name)
-    if env_value not in (None, ""):
-        return env_value
-
-    try:
-        return Variable.get(name)
-    except Exception:
-        return default
-
-
-PROJECT_ID = airflow_var("APPCUES_GCP_PROJECT_ID", "fxr-analytics")
-SCHEDULE = airflow_var("APPCUES_DAG_SCHEDULE", "0 * * * *")
-RAW_BQ_DATASET = airflow_var("APPCUES_BQ_DATASET", "appcues_raw")
-FINAL_BQ_DATASET = airflow_var("APPCUES_FINAL_BQ_DATASET", "appcues")
-BQ_TABLE = airflow_var("APPCUES_BQ_TABLE", "nps_events")
-DEFAULT_LOOKBACK_DAYS = int(airflow_var("APPCUES_DEFAULT_LOOKBACK_DAYS", "2"))
-EXPORT_JOB_TIMEOUT_SECONDS = int(
-    airflow_var("APPCUES_EXPORT_TIMEOUT_SECONDS", "1800")
-)
-EXPORT_JOB_POLL_SECONDS = int(airflow_var("APPCUES_EXPORT_POLL_SECONDS", "10"))
-REQUEST_TIMEOUT_SECONDS = int(airflow_var("APPCUES_REQUEST_TIMEOUT_SECONDS", "120"))
-STATE_VAR_NAME = airflow_var("APPCUES_BOOKMARKS_VAR_NAME", "appcues_bookmarks")
-ACCOUNT_ID_SECRET_ID = airflow_var(
-    "APPCUES_ACCOUNT_ID_SECRET_ID",
-    "APPCUES_ACCOUNT_ID",
-)
-API_KEY_SECRET_ID = airflow_var("APPCUES_API_KEY_SECRET_ID", "APPCUES_API_KEY")
-API_SECRET_SECRET_ID = airflow_var(
-    "APPCUES_API_SECRET_SECRET_ID",
-    "APPCUES_API_SECRET",
-)
 
 TABLE_SCHEMA = [
     bigquery.SchemaField("event_id", "STRING"),
@@ -82,105 +39,64 @@ TABLE_SCHEMA = [
 TABLE_COLUMNS = [field.name for field in TABLE_SCHEMA]
 
 
-def get_bq_client() -> bigquery.Client:
-    return bigquery.Client(project=PROJECT_ID)
+def env(name: str, default: str) -> str:
+    return os.getenv(name, default)
 
 
-def get_secret_client() -> secretmanager.SecretManagerServiceClient:
-    return secretmanager.SecretManagerServiceClient()
+def parse_date(value: str) -> date:
+    return datetime.fromisoformat(value).date()
 
 
-def get_bookmarks() -> dict[str, dict[str, str]]:
-    try:
-        raw = Variable.get(STATE_VAR_NAME)
-    except Exception:
-        raw = "{}"
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+def iter_days(start_date: date, end_date: date) -> Iterator[date]:
+    current = start_date
+    while current <= end_date:
+        yield current
+        current += timedelta(days=1)
 
 
-def set_bookmark(stream_name: str, bookmark_field: str, value: str) -> None:
-    bookmarks = get_bookmarks()
-    bookmarks.setdefault(stream_name, {})
-    bookmarks[stream_name][bookmark_field] = value
-    Variable.set(STATE_VAR_NAME, json.dumps(bookmarks))
-
-
-def parse_iso_date(value: str) -> date:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
-
-
-def resolve_window() -> tuple[date, date, bool]:
-    context = get_current_context()
-    ds = datetime.fromisoformat(context["ds"]).date()
-    conf = (context.get("dag_run") and context["dag_run"].conf) or {}
-    full_refresh = bool(conf.get("full_refresh", False))
-
-    if conf.get("start_date"):
-        start_date = datetime.fromisoformat(conf["start_date"]).date()
-    else:
-        start_date = ds - timedelta(
-            days=int(conf.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
-        )
-
-    end_date = (
-        datetime.fromisoformat(conf["end_date"]).date()
-        if conf.get("end_date")
-        else ds
-    )
-
-    if not full_refresh and not conf.get("start_date"):
-        bookmark = get_bookmarks().get(STREAM_NAME, {}).get("event_date")
-        if bookmark:
-            start_date = max(start_date, parse_iso_date(bookmark))
-
-    return start_date, end_date, full_refresh
-
-
-def get_secret_value(secret_id: str) -> str:
+def get_secret_value(project_id: str, secret_id: str) -> str:
     env_value = os.getenv(secret_id)
     if env_value not in (None, ""):
         return env_value
 
-    secret_path = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+    secret_path = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
     try:
-        response = get_secret_client().access_secret_version(request={"name": secret_path})
+        response = secretmanager.SecretManagerServiceClient().access_secret_version(
+            request={"name": secret_path}
+        )
     except PermissionDenied as exc:
         raise ValueError(
-            "Composer no tiene permisos para leer el secreto "
-            f"'{secret_id}'. Otorga 'roles/secretmanager.secretAccessor' "
-            "a la service account del entorno."
+            "Missing Secret Manager access. Grant roles/secretmanager.secretAccessor "
+            f"for secret '{secret_id}'."
         ) from exc
     except NotFound as exc:
         raise ValueError(
-            f"GCP Secret Manager secret '{secret_id}' no existe o no tiene una version activa."
+            f"Secret Manager secret '{secret_id}' does not exist or has no active version."
         ) from exc
 
     value = response.payload.data.decode("utf-8")
     if not value:
-        raise ValueError(f"GCP Secret Manager secret '{secret_id}' is empty.")
+        raise ValueError(f"Secret Manager secret '{secret_id}' is empty.")
     return value
 
 
-def get_basic_auth() -> HTTPBasicAuth:
+def get_basic_auth(project_id: str, api_key_secret_id: str, api_secret_secret_id: str) -> HTTPBasicAuth:
     return HTTPBasicAuth(
-        get_secret_value(API_KEY_SECRET_ID),
-        get_secret_value(API_SECRET_SECRET_ID),
+        get_secret_value(project_id, api_key_secret_id),
+        get_secret_value(project_id, api_secret_secret_id),
     )
 
 
-def get_headers() -> dict[str, str]:
-    return {"Content-Type": "application/json"}
-
-
-def get_export_url() -> str:
-    account_id = get_secret_value(ACCOUNT_ID_SECRET_ID)
-    return f"{APPCUES_API_BASE_URL}/accounts/{account_id}/export/events"
-
-
-def submit_export_job(start_date: date, end_date: date) -> str:
+def submit_export_job(
+    project_id: str,
+    account_id_secret_id: str,
+    api_key_secret_id: str,
+    api_secret_secret_id: str,
+    request_timeout_seconds: int,
+    start_date: date,
+    end_date: date,
+) -> str:
+    account_id = get_secret_value(project_id, account_id_secret_id)
     payload = {
         "format": "json",
         "start_time": start_date.isoformat(),
@@ -188,11 +104,11 @@ def submit_export_job(start_date: date, end_date: date) -> str:
         "conditions": [["name", "==", APPCUES_EVENT_NAME]],
     }
     response = requests.post(
-        get_export_url(),
-        auth=get_basic_auth(),
-        headers=get_headers(),
+        f"{APPCUES_API_BASE_URL}/accounts/{account_id}/export/events",
+        auth=get_basic_auth(project_id, api_key_secret_id, api_secret_secret_id),
+        headers={"Content-Type": "application/json"},
         json=payload,
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=request_timeout_seconds,
     )
     if response.status_code != 202:
         raise RuntimeError(
@@ -205,15 +121,23 @@ def submit_export_job(start_date: date, end_date: date) -> str:
     return job_url
 
 
-def wait_for_export_job(job_url: str) -> dict[str, Any]:
+def wait_for_export_job(
+    project_id: str,
+    api_key_secret_id: str,
+    api_secret_secret_id: str,
+    request_timeout_seconds: int,
+    export_job_timeout_seconds: int,
+    export_job_poll_seconds: int,
+    job_url: str,
+) -> dict[str, Any]:
     started_at = time.monotonic()
 
     while True:
         response = requests.get(
             job_url,
-            auth=get_basic_auth(),
-            headers=get_headers(),
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            auth=get_basic_auth(project_id, api_key_secret_id, api_secret_secret_id),
+            headers={"Content-Type": "application/json"},
+            timeout=request_timeout_seconds,
         )
         response.raise_for_status()
         payload = response.json()
@@ -225,13 +149,13 @@ def wait_for_export_job(job_url: str) -> dict[str, Any]:
         if status in {"FAILED", "ERROR", "TIMEOUT", "CANCELED"}:
             raise RuntimeError(f"Appcues export job failed: {payload}")
 
-        if time.monotonic() - started_at > EXPORT_JOB_TIMEOUT_SECONDS:
+        if time.monotonic() - started_at > export_job_timeout_seconds:
             raise TimeoutError(
                 "Appcues export job did not complete before timeout. "
                 f"Last payload: {payload}"
             )
 
-        time.sleep(EXPORT_JOB_POLL_SECONDS)
+        time.sleep(export_job_poll_seconds)
 
 
 def resolve_download_url(job_payload: dict[str, Any]) -> str:
@@ -251,14 +175,14 @@ def resolve_download_url(job_payload: dict[str, Any]) -> str:
     raise RuntimeError(f"Appcues export job completed without a download URL: {job_payload}")
 
 
-def download_export(download_url: str) -> str:
+def download_export(download_url: str, request_timeout_seconds: int) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp_file:
         temp_path = tmp_file.name
 
     with requests.get(
         download_url,
         stream=True,
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=request_timeout_seconds,
     ) as response:
         response.raise_for_status()
         with open(temp_path, "wb") as output_file:
@@ -269,14 +193,13 @@ def download_export(download_url: str) -> str:
     return temp_path
 
 
-def iter_export_lines(file_path: str):
+def iter_export_lines(file_path: str) -> Iterator[str]:
     with open(file_path, "rb") as source_file:
         magic_bytes = source_file.read(2)
 
     if magic_bytes == b"\x1f\x8b":
         with gzip.open(file_path, "rt", encoding="utf-8", errors="replace") as gzip_file:
-            for line in gzip_file:
-                yield line
+            yield from gzip_file
         return
 
     if magic_bytes == b"PK":
@@ -293,8 +216,7 @@ def iter_export_lines(file_path: str):
         return
 
     with open(file_path, "rt", encoding="utf-8", errors="replace") as plain_file:
-        for line in plain_file:
-            yield line
+        yield from plain_file
 
 
 def parse_json_field(value: Any) -> Any:
@@ -353,11 +275,7 @@ def extract_nps_score(attributes: Any) -> int | None:
     return None
 
 
-def build_row(
-    record: dict[str, Any],
-    run_date: date,
-    ingested_at: str,
-) -> dict[str, Any] | None:
+def build_row(record: dict[str, Any], run_date: date, ingested_at: str) -> dict[str, Any] | None:
     if record.get("name") != APPCUES_EVENT_NAME:
         return None
 
@@ -374,7 +292,6 @@ def build_row(
         return None
 
     identity = parse_json_field(record.get("identity"))
-
     return {
         "event_id": str(record.get("id", "")) or None,
         "event_name": str(record.get("name", "")) or None,
@@ -392,12 +309,7 @@ def build_row(
     }
 
 
-def extract_rows_from_export(
-    file_path: str,
-    window_start: date,
-    window_end: date,
-    run_date: date,
-) -> list[dict[str, Any]]:
+def extract_rows_from_export(file_path: str, run_date: date) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     ingested_at = datetime.now(UTC).isoformat()
 
@@ -440,7 +352,7 @@ def load_rows(
     client: bigquery.Client,
     table_ref: str,
     rows: list[dict[str, Any]],
-    write_disposition: str = bigquery.WriteDisposition.WRITE_APPEND,
+    write_disposition: str,
 ) -> None:
     if write_disposition != bigquery.WriteDisposition.WRITE_TRUNCATE:
         ensure_table(client, table_ref)
@@ -455,9 +367,7 @@ def load_rows(
         schema=TABLE_SCHEMA,
         write_disposition=write_disposition,
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        schema_update_options=[
-            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
-        ],
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
     try:
         job = client.load_table_from_json(rows, table_ref, job_config=job_config)
@@ -499,40 +409,34 @@ def merge_raw_into_history(
     client.query(query).result()
 
 
-def load_appcues_raw() -> dict[str, Any]:
-    context = get_current_context()
-    run_date = datetime.fromisoformat(context["ds"]).date()
-    client = get_bq_client()
-    start_date, end_date, _ = resolve_window()
-    raw_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{BQ_TABLE}"
-    final_table_ref = f"{PROJECT_ID}.{FINAL_BQ_DATASET}.{BQ_TABLE}"
-    if start_date > end_date:
-        load_rows(
-            client,
-            raw_table_ref,
-            [],
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
-        return {
-            "raw_table": raw_table_ref,
-            "final_table": final_table_ref,
-            "rows": 0,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-        }
+def process_day(args: argparse.Namespace, process_date: date) -> dict[str, Any]:
+    client = bigquery.Client(project=args.project_id)
+    raw_table_ref = f"{args.project_id}.{args.raw_dataset}.{args.raw_table}"
+    final_table_ref = f"{args.project_id}.{args.final_dataset}.{args.final_table}"
 
-    job_url = submit_export_job(start_date, end_date)
-    job_payload = wait_for_export_job(job_url)
+    job_url = submit_export_job(
+        args.project_id,
+        args.account_id_secret_id,
+        args.api_key_secret_id,
+        args.api_secret_secret_id,
+        args.request_timeout_seconds,
+        process_date,
+        process_date,
+    )
+    job_payload = wait_for_export_job(
+        args.project_id,
+        args.api_key_secret_id,
+        args.api_secret_secret_id,
+        args.request_timeout_seconds,
+        args.export_job_timeout_seconds,
+        args.export_job_poll_seconds,
+        job_url,
+    )
     download_url = resolve_download_url(job_payload)
-    export_file_path = download_export(download_url)
+    export_file_path = download_export(download_url, args.request_timeout_seconds)
 
     try:
-        rows = extract_rows_from_export(
-            export_file_path,
-            start_date,
-            end_date,
-            run_date,
-        )
+        rows = extract_rows_from_export(export_file_path, process_date)
     finally:
         if os.path.exists(export_file_path):
             os.remove(export_file_path)
@@ -543,55 +447,59 @@ def load_appcues_raw() -> dict[str, Any]:
         rows,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
     )
+    if rows:
+        merge_raw_into_history(client, raw_table_ref, final_table_ref)
 
     return {
+        "date": process_date.isoformat(),
         "raw_table": raw_table_ref,
         "final_table": final_table_ref,
         "rows": len(rows),
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
     }
 
 
-def upsert_appcues_history(load_result: dict[str, Any]) -> dict[str, Any]:
-    client = get_bq_client()
-    raw_table_ref = str(load_result["raw_table"])
-    final_table_ref = str(load_result["final_table"])
-    row_count = int(load_result.get("rows", 0))
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run Appcues NPS daily backfills on demand."
+    )
+    parser.add_argument("--start-date", required=True, type=parse_date)
+    parser.add_argument("--end-date", required=True, type=parse_date)
+    parser.add_argument("--project-id", default=env("APPCUES_GCP_PROJECT_ID", "fxr-analytics"))
+    parser.add_argument("--raw-dataset", default=env("APPCUES_BQ_DATASET", "appcues_raw"))
+    parser.add_argument("--final-dataset", default=env("APPCUES_FINAL_BQ_DATASET", "appcues"))
+    parser.add_argument("--raw-table", default=env("APPCUES_BACKFILL_BQ_TABLE", "nps_events_backfill"))
+    parser.add_argument("--final-table", default=env("APPCUES_BQ_TABLE", "nps_events"))
+    parser.add_argument("--account-id-secret-id", default=env("APPCUES_ACCOUNT_ID_SECRET_ID", "APPCUES_ACCOUNT_ID"))
+    parser.add_argument("--api-key-secret-id", default=env("APPCUES_API_KEY_SECRET_ID", "APPCUES_API_KEY"))
+    parser.add_argument("--api-secret-secret-id", default=env("APPCUES_API_SECRET_SECRET_ID", "APPCUES_API_SECRET"))
+    parser.add_argument("--request-timeout-seconds", type=int, default=int(env("APPCUES_REQUEST_TIMEOUT_SECONDS", "120")))
+    parser.add_argument("--export-job-timeout-seconds", type=int, default=int(env("APPCUES_EXPORT_TIMEOUT_SECONDS", "1800")))
+    parser.add_argument("--export-job-poll-seconds", type=int, default=int(env("APPCUES_EXPORT_POLL_SECONDS", "10")))
+    return parser.parse_args()
 
-    if row_count:
-        merge_raw_into_history(client, raw_table_ref, final_table_ref)
 
-    end_date = str(load_result["end_date"])
-    set_bookmark(STREAM_NAME, "event_date", end_date)
+def main() -> None:
+    args = parse_args()
+    if args.start_date > args.end_date:
+        raise ValueError("--start-date must be before or equal to --end-date")
 
-    return {
-        "raw_table": raw_table_ref,
-        "final_table": final_table_ref,
-        "rows": row_count,
-        "start_date": str(load_result["start_date"]),
-        "end_date": end_date,
-    }
+    total_rows = 0
+    for process_date in iter_days(args.start_date, args.end_date):
+        result = process_day(args, process_date)
+        total_rows += int(result["rows"])
+        print(json.dumps(result, sort_keys=True))
 
-
-with DAG(
-    dag_id="appcues_to_bigquery",
-    description="Extrae eventos NPS desde Appcues API y los carga en BigQuery.",
-    start_date=datetime(2024, 1, 1, tzinfo=UTC),
-    schedule=SCHEDULE,
-    catchup=False,
-    max_active_runs=1,
-    default_args={
-        "owner": "data-engineering",
-        "depends_on_past": False,
-        "retries": 2,
-        "retry_delay": timedelta(minutes=10),
-    },
-    tags=["appcues", "nps", "bigquery", "stitch-replacement"],
-) as dag:
-    load_raw_task = task(task_id="load_appcues_raw")(load_appcues_raw)()
-    upsert_history_task = task(task_id="upsert_appcues_history")(upsert_appcues_history)(
-        load_raw_task
+    print(
+        json.dumps(
+            {
+                "start_date": args.start_date.isoformat(),
+                "end_date": args.end_date.isoformat(),
+                "total_rows": total_rows,
+            },
+            sort_keys=True,
+        )
     )
 
-    load_raw_task >> upsert_history_task
+
+if __name__ == "__main__":
+    main()
