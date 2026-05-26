@@ -204,21 +204,27 @@ def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedT
     current_batch_id = batch_id()
     output_files: list[tempfile.NamedTemporaryFile] = []
     expected_file_names: list[str] = []
+    row_counts: dict[str, int] = {}
     current_file = None
+    current_file_name = None
     current_writer = None
     current_row_count = 0
     part_number = 0
+    min_event_timestamp = None
+    max_event_timestamp = None
 
     def open_next_part():
-        nonlocal current_file, current_writer, current_row_count, part_number
+        nonlocal current_file, current_file_name, current_writer, current_row_count, part_number
         if current_file is not None:
             current_file.flush()
             current_file.seek(0)
             output_files.append(current_file)
+            row_counts[current_file_name] = current_row_count
 
         part_number += 1
         file_name = f"usage_events_part_{part_number:03d}.csv"
         expected_file_names.append(file_name)
+        current_file_name = file_name
         current_file = tempfile.NamedTemporaryFile(mode="w+", newline="", suffix=".csv", delete=False)
         current_writer = csv.writer(current_file)
         current_writer.writerow(EXPORT_COLUMNS)
@@ -230,15 +236,32 @@ def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedT
         current_writer.writerow(row)
         current_row_count += 1
 
+        event_timestamp = int(row[2]) if row[2] not in ("", None) else None
+        if event_timestamp is not None:
+            min_event_timestamp = (
+                event_timestamp
+                if min_event_timestamp is None
+                else min(min_event_timestamp, event_timestamp)
+            )
+            max_event_timestamp = (
+                event_timestamp
+                if max_event_timestamp is None
+                else max(max_event_timestamp, event_timestamp)
+            )
+
     if current_file is not None:
         current_file.flush()
         current_file.seek(0)
         output_files.append(current_file)
+        row_counts[current_file_name] = current_row_count
 
     metadata = {
         "batch_id": current_batch_id,
         "expected_file_count": len(expected_file_names),
         "expected_file_names": expected_file_names,
+        "row_counts": row_counts,
+        "min_event_timestamp": min_event_timestamp,
+        "max_event_timestamp": max_event_timestamp,
     }
     return current_batch_id, output_files, metadata
 
