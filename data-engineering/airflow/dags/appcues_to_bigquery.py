@@ -451,13 +451,18 @@ def load_rows(
             client.create_table(empty_table)
         return
 
-    job_config = bigquery.LoadJobConfig(
-        schema=TABLE_SCHEMA,
-        write_disposition=write_disposition,
-        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        schema_update_options=[
+    job_config_kwargs: dict[str, Any] = {
+        "schema": TABLE_SCHEMA,
+        "write_disposition": write_disposition,
+        "create_disposition": bigquery.CreateDisposition.CREATE_IF_NEEDED,
+    }
+    if write_disposition == bigquery.WriteDisposition.WRITE_APPEND:
+        job_config_kwargs["schema_update_options"] = [
             bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
-        ],
+        ]
+
+    job_config = bigquery.LoadJobConfig(
+        **job_config_kwargs,
     )
     try:
         job = client.load_table_from_json(rows, table_ref, job_config=job_config)
