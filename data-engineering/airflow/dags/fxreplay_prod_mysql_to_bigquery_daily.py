@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import ssl
+import tempfile
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -20,7 +22,7 @@ except ImportError:
         from airflow.operators.python import get_current_context
     except ImportError:
         from airflow.decorators import get_current_context
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery
 from google.cloud import secretmanager
 
@@ -36,6 +38,8 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_MYSQL_SSL_CA_FILE: str | None = None
+DAG_REVISION = "2026-05-28T16:52:00-emaillead-int64-bool-fix"
 
 
 def airflow_var(name: str, default: str) -> str:
@@ -52,6 +56,7 @@ def airflow_var(name: str, default: str) -> str:
 PROJECT_ID = airflow_var("FXREPLAY_PROD_GCP_PROJECT_ID", "fxr-analytics")
 DAG_TIMEZONE = airflow_var("FXREPLAY_PROD_DAG_TIMEZONE", "America/Lima")
 SCHEDULE = airflow_var("FXREPLAY_PROD_DAG_SCHEDULE", "0 5 * * *")
+FAST_SCHEDULE = airflow_var("FXREPLAY_PROD_FAST_DAG_SCHEDULE", "*/30 * * * *")
 MYSQL_SECRET_NAME = airflow_var(
     "FXREPLAY_PROD_MYSQL_SECRET_NAME",
     "fxreplay_prod-mysql-connection",
@@ -86,7 +91,7 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
     },
     {
         "task_name": "positions",
-        "mysql_table": "positions",
+        "mysql_table": "position",
         "raw_bq_dataset": "fxr_ugd_raw",
         "raw_bq_table": "positions",
         "final_bq_dataset": "fxr_ugd",
@@ -100,7 +105,7 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
                 {"column": "updated_at", "direction": "DESC"},
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
-            "source_incremental_column": "updated_at",
+            "source_incremental_column": "updatedAt",
             "target_incremental_column": "updated_at",
         },
     },
@@ -126,7 +131,7 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
     },
     {
         "task_name": "symbol_library",
-        "mysql_table": "symbol_library",
+        "mysql_table": "symbollibrary",
         "raw_bq_dataset": "fxr_ugd_raw",
         "raw_bq_table": "symbol_library",
         "final_bq_dataset": "fxr_ugd",
@@ -146,7 +151,7 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
     },
     {
         "task_name": "backtesting_sessions",
-        "mysql_table": "backtesting_sessions",
+        "mysql_table": "backtestingsession",
         "raw_bq_dataset": "fxr_ugd_raw",
         "raw_bq_table": "backtesting_sessions",
         "final_bq_dataset": "fxr_ugd",
@@ -160,23 +165,23 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
                 {"column": "updated_at", "direction": "DESC"},
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
-            "source_incremental_column": "updated_at",
+            "source_incremental_column": "updatedAt",
             "target_incremental_column": "updated_at",
             "delete_not_matched_by_source": False,
         },
     },
     {
         "task_name": "users",
-        "mysql_table": "users",
+        "mysql_table": "user",
         "raw_bq_dataset": "fxr_ugd_raw",
         "raw_bq_table": "users",
         "final_bq_dataset": "fxr_ugd",
         "final_bq_table": "users",
-        "required_source_columns": ("userId", "email"),
+        "required_source_columns": ("id", "email"),
         "datetime_from_unix_seconds_columns": (),
         "merge_config": {
-            "join_keys": ("user_id",),
-            "partition_by": ("user_id",),
+            "join_keys": ("id",),
+            "partition_by": ("id",),
             "order_by": (
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
@@ -185,7 +190,36 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
             "delete_not_matched_by_source": True,
         },
     },
+    {
+        "task_name": "orders",
+        "mysql_table": "order",
+        "raw_bq_dataset": "fxr_ugd_raw",
+        "raw_bq_table": "orders",
+        "final_bq_dataset": "fxr_ugd",
+        "final_bq_table": "orders",
+        "required_source_columns": ("id", "updatedAt"),
+        "datetime_from_unix_seconds_columns": (
+            "placingTime",
+            "executionTime",
+            "autoBreakEvenTriggeredAt",
+        ),
+        "merge_config": {
+            "join_keys": ("id",),
+            "partition_by": ("id",),
+            "order_by": (
+                {"column": "updated_at", "direction": "DESC"},
+                {"column": "_loaded_at", "direction": "DESC"},
+            ),
+            "source_incremental_column": "updatedAt",
+            "target_incremental_column": "updated_at",
+            "delete_not_matched_by_source": False,
+        },
+    },
 )
+
+FAST_TASK_NAMES = {"emaillead", "users"}
+FAST_WINDOW_MINUTES = 30
+DAILY_WINDOW_PREVIOUS_DAY = True
 
 
 def validate_identifier(value: str, label: str) -> str:
@@ -220,6 +254,12 @@ def normalize_table_config(table_config: dict[str, Any]) -> dict[str, Any]:
     config["required_source_columns"] = tuple(
         str(value) for value in config.get("required_source_columns", ())
     )
+    config["fixed_window_minutes"] = (
+        int(config["fixed_window_minutes"])
+        if config.get("fixed_window_minutes") not in (None, "")
+        else None
+    )
+    config["previous_day_window"] = bool(config.get("previous_day_window", False))
     config["datetime_from_unix_seconds_columns"] = tuple(
         str(value) for value in config.get("datetime_from_unix_seconds_columns", ())
     )
@@ -311,6 +351,7 @@ def get_mysql_config() -> dict[str, Any]:
         or creds.get("database")
     )
     port = creds.get("PORT") or creds.get("port") or 3306
+    ssl_ca = creds.get("SSL_CA") or creds.get("ssl_ca")
 
     if not host or not username or not password or not database:
         raise ValueError(
@@ -323,6 +364,7 @@ def get_mysql_config() -> dict[str, Any]:
         "password": str(password),
         "database": validate_identifier(str(database), "MySQL database name"),
         "port": int(port),
+        "ssl_ca": str(ssl_ca).strip() if ssl_ca else None,
     }
 
 
@@ -330,29 +372,69 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
 
 
+def get_mysql_ssl_ca_path(mysql_config: dict[str, Any]) -> str | None:
+    global _MYSQL_SSL_CA_FILE
+
+    ssl_ca = mysql_config.get("ssl_ca")
+    if not ssl_ca:
+        return None
+    if os.path.exists(ssl_ca):
+        return ssl_ca
+    if _MYSQL_SSL_CA_FILE and os.path.exists(_MYSQL_SSL_CA_FILE):
+        return _MYSQL_SSL_CA_FILE
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix="-mysql-rds-ca.pem",
+        delete=False,
+    ) as temp_file:
+        temp_file.write(ssl_ca)
+        _MYSQL_SSL_CA_FILE = temp_file.name
+
+    return _MYSQL_SSL_CA_FILE
+
+
 def get_mysql_connection(mysql_config: dict[str, Any]):
+    ssl_ca_path = get_mysql_ssl_ca_path(mysql_config)
+
     if pymysql is not None:
+        connect_kwargs = {
+            "host": mysql_config["host"],
+            "port": int(mysql_config["port"]),
+            "user": mysql_config["username"],
+            "password": mysql_config["password"],
+            "database": mysql_config["database"],
+            "charset": "utf8mb4",
+            "autocommit": True,
+            "cursorclass": pymysql.cursors.SSCursor,
+        }
+        if ssl_ca_path:
+            ssl_context = ssl.create_default_context(cafile=ssl_ca_path)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connect_kwargs["ssl"] = {"context": ssl_context}
+
         return pymysql.connect(
-            host=mysql_config["host"],
-            port=int(mysql_config["port"]),
-            user=mysql_config["username"],
-            password=mysql_config["password"],
-            database=mysql_config["database"],
-            charset="utf8mb4",
-            autocommit=True,
-            cursorclass=pymysql.cursors.SSCursor,
+            **connect_kwargs,
         )
 
     if mysql_connector is not None:
-        return mysql_connector.connect(
-            host=mysql_config["host"],
-            port=int(mysql_config["port"]),
-            user=mysql_config["username"],
-            password=mysql_config["password"],
-            database=mysql_config["database"],
-            autocommit=True,
-            use_pure=True,
-        )
+        connect_kwargs = {
+            "host": mysql_config["host"],
+            "port": int(mysql_config["port"]),
+            "user": mysql_config["username"],
+            "password": mysql_config["password"],
+            "database": mysql_config["database"],
+            "autocommit": True,
+            "use_pure": True,
+        }
+        if ssl_ca_path:
+            connect_kwargs["ssl_disabled"] = False
+            connect_kwargs["ssl_verify_cert"] = False
+            connect_kwargs["ssl_verify_identity"] = False
+
+        return mysql_connector.connect(**connect_kwargs)
 
     raise ImportError(
         "This DAG requires either `pymysql` or `mysql-connector-python` "
@@ -360,9 +442,16 @@ def get_mysql_connection(mysql_config: dict[str, Any]):
     )
 
 
-def map_mysql_type_to_bigquery(data_type: str, numeric_scale: int | None) -> str:
+def map_mysql_type_to_bigquery(
+    data_type: str,
+    numeric_scale: int | None,
+    column_type: str | None = None,
+) -> str:
     normalized = data_type.lower()
+    normalized_column_type = (column_type or "").lower()
 
+    if normalized == "tinyint" and normalized_column_type == "tinyint(1)":
+        return "BOOL"
     if normalized in {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}:
         return "INT64"
     if normalized in {"decimal", "numeric"}:
@@ -407,6 +496,7 @@ def fetch_mysql_columns(
     SELECT
       COLUMN_NAME,
       DATA_TYPE,
+      COLUMN_TYPE,
       IS_NULLABLE,
       NUMERIC_SCALE
     FROM information_schema.columns
@@ -422,11 +512,12 @@ def fetch_mysql_columns(
             (mysql_config["database"], table_config["mysql_table"]),
         )
         columns: list[dict[str, Any]] = []
-        for column_name, data_type, is_nullable, numeric_scale in cursor.fetchall():
+        for column_name, data_type, column_type, is_nullable, numeric_scale in cursor.fetchall():
             columns.append(
                 {
                     "source_name": str(column_name),
                     "data_type": str(data_type),
+                    "column_type": str(column_type),
                     "numeric_scale": numeric_scale,
                     "is_nullable": str(is_nullable).upper() == "YES",
                 }
@@ -453,7 +544,11 @@ def build_raw_schema(mysql_columns: list[dict[str, Any]]) -> list[bigquery.Schem
     schema = [
         bigquery.SchemaField(
             column["source_name"],
-            map_mysql_type_to_bigquery(column["data_type"], column["numeric_scale"]),
+            map_mysql_type_to_bigquery(
+                column["data_type"],
+                column["numeric_scale"],
+                column.get("column_type"),
+            ),
             mode="NULLABLE",
         )
         for column in mysql_columns
@@ -486,13 +581,20 @@ def build_final_column_specs(
         target_type = (
             "DATETIME"
             if lookup_key in datetime_columns
-            else map_mysql_type_to_bigquery(column["data_type"], column["numeric_scale"])
+            else map_mysql_type_to_bigquery(
+                column["data_type"],
+                column["numeric_scale"],
+                column.get("column_type"),
+            )
         )
-        select_expression = (
-            f"DATETIME(TIMESTAMP_SECONDS(CAST(`{source_name}` AS INT64)))"
-            if lookup_key in datetime_columns
-            else f"`{source_name}`"
-        )
+        if lookup_key in datetime_columns:
+            select_expression = (
+                f"DATETIME(TIMESTAMP_SECONDS(CAST(`{source_name}` AS INT64)))"
+            )
+        elif target_type == "BOOL":
+            select_expression = f"CAST(`{source_name}` AS BOOL)"
+        else:
+            select_expression = f"`{source_name}`"
         specs.append(
             {
                 "source_name": source_name,
@@ -590,11 +692,34 @@ def reconcile_table_schema(
 
         desired_field = desired_map[field_name]
         if current_field.field_type.upper() != desired_field.field_type.upper():
+            logger.info(
+                "Attempting type change for %s.%s from %s to %s",
+                table_ref,
+                field_name,
+                current_field.field_type,
+                desired_field.field_type,
+            )
             query = (
                 f"ALTER TABLE `{table_ref}` "
                 f"ALTER COLUMN `{field_name}` SET DATA TYPE {desired_field.field_type}"
             )
-            client.query(query).result()
+            try:
+                client.query(query).result()
+            except BadRequest as exc:
+                message = str(exc)
+                if (
+                    "has streams attached" not in message
+                    and "requires that the existing column type" not in message
+                ):
+                    raise
+                logger.warning(
+                    "Skipping type change for %s.%s from %s to %s: %s",
+                    table_ref,
+                    field_name,
+                    current_field.field_type,
+                    desired_field.field_type,
+                    message,
+                )
 
     return client.get_table(table_ref)
 
@@ -605,9 +730,28 @@ def parse_runtime_timestamp(value: str) -> datetime:
 
 def resolve_runtime_window(
     last_timestamp: datetime | None,
+    fixed_window_minutes: int | None = None,
+    previous_day_window: bool = False,
 ) -> tuple[datetime | None, datetime | None]:
     context = get_current_context()
     conf = (context.get("dag_run") and context["dag_run"].conf) or {}
+
+    if previous_day_window and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
+        timezone = ZoneInfo(DAG_TIMEZONE)
+        now_local = datetime.now(timezone)
+        current_day_start = datetime.combine(
+            now_local.date(),
+            time.min,
+            tzinfo=timezone,
+        )
+        start_timestamp = current_day_start - timedelta(days=1)
+        end_timestamp = current_day_start
+        return start_timestamp, end_timestamp
+
+    if fixed_window_minutes and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
+        end_timestamp = datetime.now(UTC)
+        start_timestamp = end_timestamp - timedelta(minutes=fixed_window_minutes)
+        return start_timestamp, end_timestamp
 
     start_timestamp = last_timestamp
     if conf.get("start_timestamp"):
@@ -736,6 +880,7 @@ def build_final_schema(
 
 def sync_table_schemas(table_config: dict[str, Any]) -> dict[str, Any]:
     table_config = normalize_table_config(table_config)
+    logger.info("Running DAG revision %s", DAG_REVISION)
 
     client = get_bq_client()
     mysql_config = get_mysql_config()
@@ -780,6 +925,7 @@ def sync_table_raw(
     table_config: dict[str, Any],
 ) -> dict[str, Any]:
     table_config = normalize_table_config(table_config)
+    logger.info("Running DAG revision %s", DAG_REVISION)
     client = get_bq_client()
     raw_table_ref = str(schema_result["raw_table"])
     final_table_ref = str(schema_result["final_table"])
@@ -799,7 +945,11 @@ def sync_table_raw(
             if target_incremental_column
             else None
         )
-        start_timestamp, end_timestamp = resolve_runtime_window(last_timestamp)
+        start_timestamp, end_timestamp = resolve_runtime_window(
+            last_timestamp,
+            table_config.get("fixed_window_minutes"),
+            table_config.get("previous_day_window", False),
+        )
         query, params = build_mysql_query(
             start_timestamp,
             end_timestamp,
@@ -873,11 +1023,36 @@ def build_final_merge_query(
     raw_table_ref: str,
     final_table_ref: str,
     table_config: dict[str, Any],
+    final_field_types: dict[str, str] | None = None,
 ) -> str:
     specs = build_final_column_specs(mysql_columns, table_config)
     merge_config = table_config["merge_config"]
+
+    def normalize_bq_type_name(type_name: str) -> str:
+        normalized = str(type_name).upper()
+        if normalized == "INTEGER":
+            return "INT64"
+        return normalized
+
+    def merge_select_expression(spec: dict[str, Any]) -> str:
+        expression = str(spec["select_expression"])
+        desired_type = normalize_bq_type_name(str(spec["field"].field_type))
+        actual_type = normalize_bq_type_name(
+            (final_field_types or {}).get(str(spec["target_name"]), desired_type)
+        )
+
+        if actual_type == desired_type:
+            return expression
+        if actual_type == "STRING" and desired_type == "JSON":
+            return f"TO_JSON_STRING({expression})"
+        if actual_type == "INT64" and desired_type == "BOOL":
+            return f"IF({expression}, 1, 0)"
+        if actual_type == "STRING":
+            return f"CAST({expression} AS STRING)"
+        return expression
+
     select_clause = ",\n          ".join(
-        f"{spec['select_expression']} AS `{spec['target_name']}`"
+        f"{merge_select_expression(spec)} AS `{spec['target_name']}`"
         for spec in specs
     )
     insert_columns = ",\n      ".join(f"`{spec['target_name']}`" for spec in specs)
@@ -949,6 +1124,7 @@ def merge_table_to_final(
     table_config: dict[str, Any],
 ) -> dict[str, Any]:
     table_config = normalize_table_config(table_config)
+    logger.info("Running DAG revision %s", DAG_REVISION)
     client = get_bq_client()
     raw_table_ref = str(raw_result["target_table"])
     final_table_ref = str(raw_result["final_table"])
@@ -959,11 +1135,21 @@ def merge_table_to_final(
     finally:
         connection.close()
 
+    final_table = reconcile_table_schema(
+        client,
+        final_table_ref,
+        build_final_schema(mysql_columns, table_config),
+    )
+    final_field_types = {
+        field.name: str(field.field_type).upper()
+        for field in final_table.schema
+    }
     query = build_final_merge_query(
         mysql_columns,
         raw_table_ref,
         final_table_ref,
         table_config,
+        final_field_types,
     )
     job = client.query(query)
     job.result()
@@ -980,8 +1166,8 @@ def merge_table_to_final(
     }
 
 
-def build_table_tasks() -> None:
-    for table_config in TABLE_CONFIGS:
+def build_table_tasks(table_configs: tuple[dict[str, Any], ...]) -> None:
+    for table_config in table_configs:
         normalized_config = normalize_table_config(table_config)
         task_suffix = normalized_config["task_name"]
 
@@ -1002,22 +1188,58 @@ def build_table_tasks() -> None:
         sync_schema_task >> sync_raw_task >> merge_final_task
 
 
-with DAG(
-    dag_id="fxreplay_prod_mysql_to_bigquery",
+def create_pipeline_dag(
+    dag_id: str,
+    description: str,
+    schedule: str,
+    tags: list[str],
+    task_names: set[str] | None = None,
+    table_configs: tuple[dict[str, Any], ...] | None = None,
+):
+    if table_configs is not None:
+        selected_configs = table_configs
+    else:
+        selected_configs = tuple(
+            table_config
+            for table_config in TABLE_CONFIGS
+            if task_names is None or str(table_config["task_name"]) in task_names
+        )
+
+    with DAG(
+        dag_id=dag_id,
+        description=description,
+        start_date=datetime(2024, 1, 1, 5, 0, tzinfo=ZoneInfo(DAG_TIMEZONE)),
+        schedule=schedule,
+        catchup=False,
+        max_active_runs=1,
+        default_args={
+            "owner": "data-engineering",
+            "depends_on_past": False,
+            "retries": 2,
+            "retry_delay": timedelta(minutes=10),
+        },
+        tags=tags,
+    ) as dag:
+        build_table_tasks(selected_configs)
+
+    return dag
+
+
+dag = create_pipeline_dag(
+    dag_id="fxreplay_prod_mysql_to_bigquery_daily",
     description=(
         "Carga incremental diaria de multiples tablas de fxreplay_prod hacia "
         "BigQuery raw y final."
     ),
-    start_date=datetime(2024, 1, 1, 5, 0, tzinfo=ZoneInfo(DAG_TIMEZONE)),
     schedule=SCHEDULE,
-    catchup=False,
-    max_active_runs=1,
-    default_args={
-        "owner": "data-engineering",
-        "depends_on_past": False,
-        "retries": 2,
-        "retry_delay": timedelta(minutes=10),
-    },
     tags=["mysql", "bigquery", "fxreplay-prod", "raw", "daily"],
-) as dag:
-    build_table_tasks()
+    table_configs=tuple(
+        normalize_table_config(
+            {
+                **table_config,
+                "previous_day_window": DAILY_WINDOW_PREVIOUS_DAY,
+            }
+        )
+        for table_config in TABLE_CONFIGS
+    ),
+)

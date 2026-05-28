@@ -29,7 +29,7 @@ Cloud Run Job que:
 
 - La tabla raw guarda columnas de auditoria como `batch_id`, `source_file_name` y `loaded_at`.
 - La tabla raw evita duplicados por `batch_id + unique_id`.
-- La tabla final evita duplicados por `unique_id`.
+- La tabla final evita duplicados por `unique_id` y agrega `_ingested_at` con la fecha/hora de ingesta.
 - Si el mismo batch se procesa dos veces, no vuelve a insertar registros ya existentes en la tabla final.
 
 ## Scheduler

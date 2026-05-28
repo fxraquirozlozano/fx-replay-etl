@@ -216,6 +216,13 @@ def raw_table_schema(schema: list[bigquery.SchemaField]) -> list[bigquery.Schema
     ]
 
 
+def final_table_schema(schema: list[bigquery.SchemaField]) -> list[bigquery.SchemaField]:
+    return [
+        *schema,
+        bigquery.SchemaField("_ingested_at", "TIMESTAMP"),
+    ]
+
+
 def normalize_value(raw_value: str, field: bigquery.SchemaField) -> str:
     if raw_value == "":
         return raw_value
@@ -284,7 +291,12 @@ def ensure_table(
     table_ref = f"{PROJECT_ID}.{dataset_id}.{table_id}"
     ensure_dataset(client, dataset_id)
     try:
-        client.get_table(table_ref)
+        table = client.get_table(table_ref)
+        existing_names = {field.name for field in table.schema}
+        missing_fields = [field for field in schema if field.name not in existing_names]
+        if missing_fields:
+            table.schema = [*table.schema, *missing_fields]
+            client.update_table(table, ["schema"])
     except Exception:
         client.create_table(bigquery.Table(table_ref, schema=schema))
 
@@ -343,8 +355,8 @@ def merge_final_table(
     USING `{temp_table_ref}` AS src
     ON target.unique_id = src.unique_id
     WHEN NOT MATCHED THEN
-      INSERT ({insert_columns})
-      VALUES ({insert_values})
+      INSERT ({insert_columns}, _ingested_at)
+      VALUES ({insert_values}, src.loaded_at)
     """
     client.query(sql).result()
 
@@ -358,7 +370,7 @@ def load_predictions(batch_id: str, csv_paths: list[Path], schema: list[bigquery
         f"_tmp_{sanitize_identifier(RAW_BQ_TABLE)}_{sanitize_identifier(batch_id)}"
     )
     raw_schema = raw_table_schema(schema)
-    final_schema = schema
+    final_schema = final_table_schema(schema)
 
     ensure_table(client, RAW_BQ_DATASET, RAW_BQ_TABLE, raw_schema)
     ensure_table(client, DATASET, TABLE, final_schema)
