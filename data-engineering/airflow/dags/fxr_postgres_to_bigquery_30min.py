@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import time as time_module
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -30,9 +31,11 @@ from google.cloud import storage
 
 try:
     import psycopg2
+    from psycopg2 import errors as psycopg2_errors
     from psycopg2 import extensions as psycopg2_extensions
 except ImportError:
     psycopg2 = None
+    psycopg2_errors = None
     psycopg2_extensions = None
 
 
@@ -78,6 +81,12 @@ POSTGRES_FETCH_SIZE = int(airflow_var("FXR_POSTGRES_FETCH_SIZE", "10000"))
 BQ_LOAD_BATCH_SIZE = int(airflow_var("FXR_POSTGRES_BQ_LOAD_BATCH_SIZE", "5000"))
 WATERMARK_LOOKBACK_SECONDS = int(
     airflow_var("FXR_POSTGRES_WATERMARK_LOOKBACK_SECONDS", "0")
+)
+POSTGRES_RECOVERY_RETRY_ATTEMPTS = int(
+    airflow_var("FXR_POSTGRES_RECOVERY_RETRY_ATTEMPTS", "4")
+)
+POSTGRES_RECOVERY_RETRY_DELAY_SECONDS = int(
+    airflow_var("FXR_POSTGRES_RECOVERY_RETRY_DELAY_SECONDS", "30")
 )
 GCS_STAGING_BUCKET = airflow_var("FXR_POSTGRES_GCS_STAGING_BUCKET", "fx-replay-etl")
 GCS_STAGING_PREFIX = airflow_var(
@@ -729,6 +738,12 @@ def sanitize_temporal_string(value: str, field: bigquery.SchemaField) -> str | N
     return value
 
 
+def is_retryable_recovery_conflict(exc: Exception) -> bool:
+    if psycopg2_errors is not None and isinstance(exc, psycopg2_errors.SerializationFailure):
+        return "conflict with recovery" in str(exc).lower()
+    return "conflict with recovery" in str(exc).lower()
+
+
 def coerce_row_to_schema(
     row: dict[str, Any],
     schema: list[bigquery.SchemaField],
@@ -865,43 +880,42 @@ def stage_table_raw_to_gcs(
     final_table_ref = str(schema_result["final_table"])
     loaded_at = datetime.now(UTC).isoformat()
     postgres_config = get_postgres_config()
-    connection = get_postgres_connection(postgres_config)
+    target_incremental_column = table_config["merge_config"]["target_incremental_column"]
+    last_timestamp = (
+        get_max_table_timestamp(
+            client,
+            final_table_ref,
+            target_incremental_column,
+        )
+        if target_incremental_column
+        else None
+    )
+    start_timestamp, end_timestamp = resolve_runtime_window(last_timestamp)
+    query, params = build_postgres_query(start_timestamp, end_timestamp, table_config)
 
-    try:
-        target_incremental_column = table_config["merge_config"]["target_incremental_column"]
-        last_timestamp = (
-            get_max_table_timestamp(
-                client,
-                final_table_ref,
-                target_incremental_column,
-            )
-            if target_incremental_column
-            else None
-        )
-        start_timestamp, end_timestamp = resolve_runtime_window(last_timestamp)
-        query, params = build_postgres_query(start_timestamp, end_timestamp, table_config)
+    raw_table = client.get_table(raw_table_ref)
+    run_id = sanitize_gcs_path_component(str(context.get("run_id", "manual")))
+    logical_date = context.get("logical_date")
+    logical_date_part = (
+        sanitize_gcs_path_component(str(logical_date.isoformat()))
+        if isinstance(logical_date, datetime)
+        else "no-logical-date"
+    )
+    gcs_blob_name = (
+        f"{GCS_STAGING_PREFIX.rstrip('/')}/"
+        f"{table_config['task_name']}/"
+        f"{logical_date_part}/"
+        f"{run_id}.jsonl"
+    )
+    logger.info(
+        "Raw staging target for %s: gs://%s/%s",
+        raw_table_ref,
+        GCS_STAGING_BUCKET,
+        gcs_blob_name,
+    )
 
-        raw_table = client.get_table(raw_table_ref)
-        total_rows = 0
-        run_id = sanitize_gcs_path_component(str(context.get("run_id", "manual")))
-        logical_date = context.get("logical_date")
-        logical_date_part = (
-            sanitize_gcs_path_component(str(logical_date.isoformat()))
-            if isinstance(logical_date, datetime)
-            else "no-logical-date"
-        )
-        gcs_blob_name = (
-            f"{GCS_STAGING_PREFIX.rstrip('/')}/"
-            f"{table_config['task_name']}/"
-            f"{logical_date_part}/"
-            f"{run_id}.jsonl"
-        )
-        logger.info(
-            "Raw staging target for %s: gs://%s/%s",
-            raw_table_ref,
-            GCS_STAGING_BUCKET,
-            gcs_blob_name,
-        )
+    for attempt in range(1, POSTGRES_RECOVERY_RETRY_ATTEMPTS + 1):
+        connection = get_postgres_connection(postgres_config)
         snapshot_file = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -909,70 +923,86 @@ def stage_table_raw_to_gcs(
             delete=False,
         )
         snapshot_file_path = snapshot_file.name
-        cursor = connection.cursor()
-        cursor.arraysize = POSTGRES_FETCH_SIZE
+        total_rows = 0
         try:
-            cursor.execute(query, params)
-            if cursor.description is None:
-                raise ValueError("PostgreSQL cursor metadata is unavailable after execute.")
-            column_names = [column.name for column in cursor.description]
+            cursor = connection.cursor()
+            cursor.arraysize = POSTGRES_FETCH_SIZE
+            try:
+                cursor.execute(query, params)
+                if cursor.description is None:
+                    raise ValueError("PostgreSQL cursor metadata is unavailable after execute.")
+                column_names = [column.name for column in cursor.description]
 
-            while True:
-                batch = cursor.fetchmany(POSTGRES_FETCH_SIZE)
-                if not batch:
-                    break
+                while True:
+                    batch = cursor.fetchmany(POSTGRES_FETCH_SIZE)
+                    if not batch:
+                        break
 
-                json_rows = []
-                for record in batch:
-                    row = {
-                        column_name: normalize_value(value)
-                        for column_name, value in zip(column_names, record)
-                    }
-                    row["_loaded_at"] = loaded_at
-                    json_rows.append(coerce_row_to_schema(row, raw_table.schema))
+                    json_rows = []
+                    for record in batch:
+                        row = {
+                            column_name: normalize_value(value)
+                            for column_name, value in zip(column_names, record)
+                        }
+                        row["_loaded_at"] = loaded_at
+                        json_rows.append(coerce_row_to_schema(row, raw_table.schema))
 
-                for row in json_rows:
-                    snapshot_file.write(json.dumps(row, separators=(",", ":")))
-                    snapshot_file.write("\n")
+                    for row in json_rows:
+                        snapshot_file.write(json.dumps(row, separators=(",", ":")))
+                        snapshot_file.write("\n")
 
-                total_rows += len(json_rows)
-                logger.info("Staged %s rows for %s", total_rows, raw_table_ref)
-        finally:
-            cursor.close()
-            snapshot_file.close()
+                    total_rows += len(json_rows)
+                    logger.info("Staged %s rows for %s", total_rows, raw_table_ref)
+            finally:
+                cursor.close()
+                snapshot_file.close()
 
-        try:
-            staged_gcs_uri = upload_file_to_gcs(snapshot_file_path, gcs_blob_name)
-            logger.info("Uploaded staged rows for %s to %s", raw_table_ref, staged_gcs_uri)
-        finally:
+            try:
+                staged_gcs_uri = upload_file_to_gcs(snapshot_file_path, gcs_blob_name)
+                logger.info("Uploaded staged rows for %s to %s", raw_table_ref, staged_gcs_uri)
+            finally:
+                if os.path.exists(snapshot_file_path):
+                    os.unlink(snapshot_file_path)
+
+            return {
+                "task_name": table_config["task_name"],
+                "target_table": raw_table_ref,
+                "final_table": final_table_ref,
+                "rows_loaded": total_rows,
+                "staged_gcs_uri": staged_gcs_uri,
+                "last_timestamp": (
+                    last_timestamp.isoformat()
+                    if isinstance(last_timestamp, datetime)
+                    else None
+                ),
+                "effective_start_timestamp": (
+                    start_timestamp.isoformat()
+                    if isinstance(start_timestamp, datetime)
+                    else None
+                ),
+                "effective_end_timestamp": (
+                    end_timestamp.isoformat()
+                    if isinstance(end_timestamp, datetime)
+                    else None
+                ),
+                "loaded_at": loaded_at,
+            }
+        except Exception as exc:
             if os.path.exists(snapshot_file_path):
                 os.unlink(snapshot_file_path)
-
-        return {
-            "task_name": table_config["task_name"],
-            "target_table": raw_table_ref,
-            "final_table": final_table_ref,
-            "rows_loaded": total_rows,
-            "staged_gcs_uri": staged_gcs_uri,
-            "last_timestamp": (
-                last_timestamp.isoformat()
-                if isinstance(last_timestamp, datetime)
-                else None
-            ),
-            "effective_start_timestamp": (
-                start_timestamp.isoformat()
-                if isinstance(start_timestamp, datetime)
-                else None
-            ),
-            "effective_end_timestamp": (
-                end_timestamp.isoformat()
-                if isinstance(end_timestamp, datetime)
-                else None
-            ),
-            "loaded_at": loaded_at,
-        }
-    finally:
-        connection.close()
+            if not is_retryable_recovery_conflict(exc) or attempt == POSTGRES_RECOVERY_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                "Retrying PostgreSQL extract for %s after standby recovery conflict "
+                "(attempt %s/%s): %s",
+                table_config["task_name"],
+                attempt,
+                POSTGRES_RECOVERY_RETRY_ATTEMPTS,
+                exc,
+            )
+            time_module.sleep(POSTGRES_RECOVERY_RETRY_DELAY_SECONDS)
+        finally:
+            connection.close()
 
 
 def load_table_raw_from_gcs(

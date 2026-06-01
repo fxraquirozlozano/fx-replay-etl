@@ -1043,12 +1043,27 @@ def build_final_merge_query(
             return f"IF({expression}, 1, 0)"
         if target_type == "JSON" and source_type == "STRING":
             return f"PARSE_JSON({expression})"
+        if target_type in {"NUMERIC", "BIGNUMERIC"}:
+            if source_type == "FLOAT64":
+                return (
+                    f"CASE WHEN {expression} IS NULL OR IS_NAN({expression}) "
+                    f"OR IS_INF({expression}) "
+                    f"THEN NULL ELSE SAFE_CAST({expression} AS {target_type}) END"
+                )
+            if source_type == "STRING":
+                normalized_expression = f"LOWER(TRIM({expression}))"
+                return (
+                    f"CASE WHEN {expression} IS NULL "
+                    f"OR {normalized_expression} IN "
+                    f"('nan', '+nan', '-nan', 'inf', '+inf', '-inf', "
+                    f"'infinity', '+infinity', '-infinity') "
+                    f"THEN NULL ELSE SAFE_CAST({expression} AS {target_type}) END"
+                )
+            return f"SAFE_CAST({expression} AS {target_type})"
         if target_type in {
             "STRING",
             "INT64",
             "FLOAT64",
-            "NUMERIC",
-            "BIGNUMERIC",
             "BOOL",
             "DATE",
             "TIME",
