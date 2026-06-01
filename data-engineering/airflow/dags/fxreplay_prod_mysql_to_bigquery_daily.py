@@ -589,7 +589,13 @@ def build_final_column_specs(
         )
         if lookup_key in datetime_columns:
             select_expression = (
-                f"DATETIME(TIMESTAMP_SECONDS(CAST(`{source_name}` AS INT64)))"
+                "CASE "
+                f"WHEN SAFE_CAST(`{source_name}` AS INT64) IS NULL THEN NULL "
+                f"WHEN ABS(CAST(`{source_name}` AS INT64)) <= 253402300799 "
+                f"THEN DATETIME(TIMESTAMP_SECONDS(CAST(`{source_name}` AS INT64))) "
+                f"WHEN ABS(CAST(`{source_name}` AS INT64)) <= 253402300799999 "
+                f"THEN DATETIME(TIMESTAMP_MILLIS(CAST(`{source_name}` AS INT64))) "
+                "ELSE NULL END"
             )
         elif target_type == "BOOL":
             select_expression = f"CAST(`{source_name}` AS BOOL)"
@@ -735,6 +741,17 @@ def resolve_runtime_window(
 ) -> tuple[datetime | None, datetime | None]:
     context = get_current_context()
     conf = (context.get("dag_run") and context["dag_run"].conf) or {}
+    data_interval_start = context.get("data_interval_start")
+    data_interval_end = context.get("data_interval_end")
+
+    if (
+        (previous_day_window or fixed_window_minutes)
+        and not conf.get("start_timestamp")
+        and not conf.get("end_timestamp")
+        and data_interval_start is not None
+        and data_interval_end is not None
+    ):
+        return data_interval_start, data_interval_end
 
     if previous_day_window and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
         timezone = ZoneInfo(DAG_TIMEZONE)
@@ -1047,6 +1064,8 @@ def build_final_merge_query(
             return f"TO_JSON_STRING({expression})"
         if actual_type == "INT64" and desired_type == "BOOL":
             return f"IF({expression}, 1, 0)"
+        if actual_type == "INT64" and desired_type == "DATETIME":
+            return f"UNIX_SECONDS(TIMESTAMP({expression}))"
         if actual_type == "STRING":
             return f"CAST({expression} AS STRING)"
         return expression
@@ -1241,5 +1260,6 @@ dag = create_pipeline_dag(
             }
         )
         for table_config in TABLE_CONFIGS
+        if str(table_config["task_name"]) not in FAST_TASK_NAMES
     ),
 )
