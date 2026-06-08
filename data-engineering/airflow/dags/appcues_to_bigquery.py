@@ -43,7 +43,7 @@ def airflow_var(name: str, default: str) -> str:
 
 
 PROJECT_ID = airflow_var("APPCUES_GCP_PROJECT_ID", "fxr-analytics")
-SCHEDULE = airflow_var("APPCUES_DAG_SCHEDULE", "0 * * * *")
+SCHEDULE = airflow_var("APPCUES_DAG_SCHEDULE", "0 6 * * *")
 RAW_BQ_DATASET = airflow_var("APPCUES_BQ_DATASET", "appcues_raw")
 FINAL_BQ_DATASET = airflow_var("APPCUES_FINAL_BQ_DATASET", "appcues")
 BQ_TABLE = airflow_var("APPCUES_BQ_TABLE", "nps_events")

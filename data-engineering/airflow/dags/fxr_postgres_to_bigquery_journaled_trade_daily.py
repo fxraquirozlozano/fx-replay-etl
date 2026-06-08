@@ -599,15 +599,34 @@ def ensure_utc_datetime(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
+def utc_day_start(value: datetime | None) -> datetime | None:
+    normalized = ensure_utc_datetime(value)
+    if normalized is None:
+        return None
+    return datetime.combine(normalized.date(), time.min, tzinfo=UTC)
+
+
+def utc_next_day_start(value: datetime | None) -> datetime | None:
+    normalized = ensure_utc_datetime(value)
+    if normalized is None:
+        return None
+    return datetime.combine(normalized.date(), time.min, tzinfo=UTC) + timedelta(days=1)
+
+
 def resolve_runtime_window(last_timestamp: datetime | None) -> tuple[datetime | None, datetime | None]:
+    del last_timestamp
     context = get_current_context()
     conf = (context.get("dag_run") and context["dag_run"].conf) or {}
     data_interval_start = ensure_utc_datetime(context.get("data_interval_start"))
-    data_interval_end = ensure_utc_datetime(context.get("data_interval_end"))
+    default_day = data_interval_start or (datetime.now(UTC) - timedelta(days=1))
+    start_timestamp = utc_day_start(default_day)
+    end_timestamp = utc_next_day_start(default_day)
 
-    start_timestamp = data_interval_start or last_timestamp
     if conf.get("start_timestamp"):
-        start_timestamp = ensure_utc_datetime(
+        start_timestamp = utc_day_start(
+            parse_runtime_timestamp(str(conf["start_timestamp"]))
+        )
+        end_timestamp = utc_next_day_start(
             parse_runtime_timestamp(str(conf["start_timestamp"]))
         )
 
@@ -620,9 +639,8 @@ def resolve_runtime_window(last_timestamp: datetime | None) -> tuple[datetime | 
             seconds=WATERMARK_LOOKBACK_SECONDS
         )
 
-    end_timestamp = data_interval_end
     if conf.get("end_timestamp"):
-        end_timestamp = ensure_utc_datetime(
+        end_timestamp = utc_day_start(
             parse_runtime_timestamp(str(conf["end_timestamp"]))
         )
 
@@ -1109,11 +1127,11 @@ def delete_final_window(
     filters: list[str] = []
     if isinstance(normalized_start, datetime):
         filters.append(
-            f"DATE(`{target_incremental_column}`, 'UTC') >= DATE('{normalized_start.date().isoformat()}')"
+            f"`{target_incremental_column}` >= TIMESTAMP('{normalized_start.isoformat().replace('+00:00', 'Z')}')"
         )
     if isinstance(normalized_end, datetime):
         filters.append(
-            f"DATE(`{target_incremental_column}`, 'UTC') < DATE('{normalized_end.date().isoformat()}')"
+            f"`{target_incremental_column}` < TIMESTAMP('{normalized_end.isoformat().replace('+00:00', 'Z')}')"
         )
     if not filters:
         raise ValueError(f"Daily delete window is required for {final_table_ref}.")

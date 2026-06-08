@@ -90,18 +90,17 @@ FINAL_BQ_DATASET = airflow_var("FXR_POSTGRES_FINAL_BQ_DATASET", "fxr_ugd")
 
 TABLE_SPECS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     ("indicators", "chart_demo", ("id",), "updated_at"),
-    ("indicators", "indicator_version", ("id",), "updated_at"),
     ("indicators", "indicator_reaction", ("id",), "updated_at"),
-    ("indicators", "indicator", ("id",), "updated_at"),
     ("indicators", "pine_script_comment", ("id",), "updated_at"),
     ("journal", "tag", ("id",), "updated_at"),
     ("journal", "tag_group", ("id",), "updated_at"),
-    ("journal", "journaled_trade", ("id",), "updated_at"),
     ("journal", "journaled_trade_order", ("id",), "updated_at"),
     ("journal", "journaled_trade_tag", ("id",), "updated_at"),
     ("journal", "journaled_trade_file", ("id",), "updated_at"),
     ("journal", "trading_account", ("id",), "updated_at"),
     ("journal", "trading_account_transaction", ("id",), "updated_at"),
+    ("indicators", "indicator_version", ("id",), "updated_at"),
+    ("indicators", "indicator", ("id",), "updated_at"),
 )
 
 

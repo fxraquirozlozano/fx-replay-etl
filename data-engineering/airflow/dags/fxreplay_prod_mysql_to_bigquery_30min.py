@@ -79,9 +79,9 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
         "task_name": "emaillead",
         "mysql_table": "emaillead",
         "raw_bq_dataset": "fxr_ugd_raw",
-        "raw_bq_table": "emaillead",
+        "raw_bq_table": "email_lead",
         "final_bq_dataset": "fxr_ugd",
-        "final_bq_table": "email_leads",
+        "final_bq_table": "email_lead",
         "required_source_columns": ("id", "createdAt"),
         "datetime_from_unix_seconds_columns": (),
         "merge_config": {
@@ -1289,10 +1289,16 @@ dag = create_pipeline_dag(
     tags=["mysql", "bigquery", "fxreplay-prod", "raw", "30min"],
     table_configs=tuple(
         normalize_table_config(
-            {
-                **table_config,
-                "fixed_window_minutes": FAST_WINDOW_MINUTES,
-            }
+            (
+                {
+                    **table_config,
+                    "fixed_window_minutes": FAST_WINDOW_MINUTES,
+                }
+                if str(table_config["task_name"]) == "users"
+                else {
+                    **table_config,
+                }
+            )
         )
         for table_config in TABLE_CONFIGS
     ),

@@ -734,6 +734,28 @@ def parse_runtime_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def ensure_utc_datetime(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def utc_day_start(value: datetime | None) -> datetime | None:
+    normalized = ensure_utc_datetime(value)
+    if normalized is None:
+        return None
+    return datetime.combine(normalized.date(), time.min, tzinfo=UTC)
+
+
+def utc_next_day_start(value: datetime | None) -> datetime | None:
+    normalized = ensure_utc_datetime(value)
+    if normalized is None:
+        return None
+    return datetime.combine(normalized.date(), time.min, tzinfo=UTC) + timedelta(days=1)
+
+
 def resolve_runtime_window(
     last_timestamp: datetime | None,
     fixed_window_minutes: int | None = None,
@@ -744,8 +766,15 @@ def resolve_runtime_window(
     data_interval_start = context.get("data_interval_start")
     data_interval_end = context.get("data_interval_end")
 
+    if previous_day_window and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
+        del last_timestamp
+        default_day = ensure_utc_datetime(data_interval_start) or (
+            datetime.now(UTC) - timedelta(days=1)
+        )
+        return utc_day_start(default_day), utc_next_day_start(default_day)
+
     if (
-        (previous_day_window or fixed_window_minutes)
+        fixed_window_minutes
         and not conf.get("start_timestamp")
         and not conf.get("end_timestamp")
         and data_interval_start is not None
@@ -753,26 +782,18 @@ def resolve_runtime_window(
     ):
         return data_interval_start, data_interval_end
 
-    if previous_day_window and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
-        timezone = ZoneInfo(DAG_TIMEZONE)
-        now_local = datetime.now(timezone)
-        current_day_start = datetime.combine(
-            now_local.date(),
-            time.min,
-            tzinfo=timezone,
-        )
-        start_timestamp = current_day_start - timedelta(days=1)
-        end_timestamp = current_day_start
-        return start_timestamp, end_timestamp
-
     if fixed_window_minutes and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
         end_timestamp = datetime.now(UTC)
         start_timestamp = end_timestamp - timedelta(minutes=fixed_window_minutes)
         return start_timestamp, end_timestamp
 
     start_timestamp = last_timestamp
+    end_timestamp = None
     if conf.get("start_timestamp"):
-        start_timestamp = parse_runtime_timestamp(str(conf["start_timestamp"]))
+        parsed_start = parse_runtime_timestamp(str(conf["start_timestamp"]))
+        start_timestamp = utc_day_start(parsed_start) if previous_day_window else parsed_start
+        if previous_day_window and not conf.get("end_timestamp"):
+            end_timestamp = utc_next_day_start(parsed_start)
 
     if (
         start_timestamp is not None
@@ -783,9 +804,9 @@ def resolve_runtime_window(
             seconds=WATERMARK_LOOKBACK_SECONDS
         )
 
-    end_timestamp = None
     if conf.get("end_timestamp"):
-        end_timestamp = parse_runtime_timestamp(str(conf["end_timestamp"]))
+        parsed_end = parse_runtime_timestamp(str(conf["end_timestamp"]))
+        end_timestamp = utc_day_start(parsed_end) if previous_day_window else parsed_end
 
     return start_timestamp, end_timestamp
 
@@ -818,10 +839,10 @@ def build_mysql_query(
     params: list[Any] = []
 
     if start_timestamp is not None:
-        filters.append(f"`{updated_column}` > %s")
+        filters.append(f"`{updated_column}` >= %s")
         params.append(start_timestamp)
     if end_timestamp is not None:
-        filters.append(f"`{updated_column}` <= %s")
+        filters.append(f"`{updated_column}` < %s")
         params.append(end_timestamp)
 
     logger.info(
@@ -1138,6 +1159,91 @@ def build_final_merge_query(
     """
 
 
+def build_final_insert_query(
+    mysql_columns: list[dict[str, Any]],
+    raw_table_ref: str,
+    final_table_ref: str,
+    table_config: dict[str, Any],
+    final_field_types: dict[str, str] | None = None,
+) -> str:
+    specs = build_final_column_specs(mysql_columns, table_config)
+
+    def normalize_bq_type_name(type_name: str) -> str:
+        normalized = str(type_name).upper()
+        if normalized == "INTEGER":
+            return "INT64"
+        return normalized
+
+    def insert_select_expression(spec: dict[str, Any]) -> str:
+        expression = str(spec["select_expression"])
+        desired_type = normalize_bq_type_name(str(spec["field"].field_type))
+        actual_type = normalize_bq_type_name(
+            (final_field_types or {}).get(str(spec["target_name"]), desired_type)
+        )
+
+        if actual_type == desired_type:
+            return expression
+        if actual_type == "STRING" and desired_type == "JSON":
+            return f"TO_JSON_STRING({expression})"
+        if actual_type == "INT64" and desired_type == "BOOL":
+            return f"IF({expression}, 1, 0)"
+        if actual_type == "INT64" and desired_type == "DATETIME":
+            return f"UNIX_SECONDS(TIMESTAMP({expression}))"
+        if actual_type == "STRING":
+            return f"CAST({expression} AS STRING)"
+        return expression
+
+    select_clause = ",\n      ".join(
+        f"{insert_select_expression(spec)} AS `{spec['target_name']}`"
+        for spec in specs
+    )
+    insert_columns = ",\n      ".join(f"`{spec['target_name']}`" for spec in specs)
+    return f"""
+    INSERT INTO `{final_table_ref}` (
+      {insert_columns}
+    )
+    SELECT
+      {select_clause}
+    FROM `{raw_table_ref}`
+    """
+
+
+def delete_final_window(
+    client: bigquery.Client,
+    final_table_ref: str,
+    table_config: dict[str, Any],
+    start_timestamp: datetime | None,
+    end_timestamp: datetime | None,
+) -> int | None:
+    target_incremental_column = table_config["merge_config"]["target_incremental_column"]
+    if target_incremental_column is None:
+        raise ValueError(
+            f"Daily delete requires target_incremental_column for {final_table_ref}."
+        )
+
+    normalized_start = ensure_utc_datetime(start_timestamp)
+    normalized_end = ensure_utc_datetime(end_timestamp)
+    filters: list[str] = []
+    if isinstance(normalized_start, datetime):
+        filters.append(
+            f"`{target_incremental_column}` >= TIMESTAMP('{normalized_start.isoformat().replace('+00:00', 'Z')}')"
+        )
+    if isinstance(normalized_end, datetime):
+        filters.append(
+            f"`{target_incremental_column}` < TIMESTAMP('{normalized_end.isoformat().replace('+00:00', 'Z')}')"
+        )
+    if not filters:
+        raise ValueError(f"Daily delete window is required for {final_table_ref}.")
+
+    query = f"""
+    DELETE FROM `{final_table_ref}`
+    WHERE {" AND ".join(filters)}
+    """
+    job = client.query(query)
+    job.result()
+    return job.num_dml_affected_rows
+
+
 def merge_table_to_final(
     raw_result: dict[str, Any],
     table_config: dict[str, Any],
@@ -1163,22 +1269,53 @@ def merge_table_to_final(
         field.name: str(field.field_type).upper()
         for field in final_table.schema
     }
-    query = build_final_merge_query(
-        mysql_columns,
-        raw_table_ref,
-        final_table_ref,
-        table_config,
-        final_field_types,
-    )
-    job = client.query(query)
-    job.result()
+    target_incremental_column = table_config["merge_config"]["target_incremental_column"]
+    delete_count: int | None = None
+    inserted_rows: int | None = None
+    merged_rows: int | None = None
+
+    if target_incremental_column:
+        delete_count = delete_final_window(
+            client,
+            final_table_ref,
+            table_config,
+            parse_runtime_timestamp(str(raw_result["effective_start_timestamp"]))
+            if raw_result.get("effective_start_timestamp")
+            else None,
+            parse_runtime_timestamp(str(raw_result["effective_end_timestamp"]))
+            if raw_result.get("effective_end_timestamp")
+            else None,
+        )
+        query = build_final_insert_query(
+            mysql_columns,
+            raw_table_ref,
+            final_table_ref,
+            table_config,
+            final_field_types,
+        )
+        job = client.query(query)
+        job.result()
+        inserted_rows = job.num_dml_affected_rows
+    else:
+        query = build_final_merge_query(
+            mysql_columns,
+            raw_table_ref,
+            final_table_ref,
+            table_config,
+            final_field_types,
+        )
+        job = client.query(query)
+        job.result()
+        merged_rows = job.num_dml_affected_rows
 
     return {
         "task_name": table_config["task_name"],
         "raw_table": raw_table_ref,
         "final_table": final_table_ref,
         "raw_rows_loaded": int(raw_result.get("rows_loaded", 0)),
-        "merged_rows": job.num_dml_affected_rows,
+        "deleted_rows": delete_count,
+        "inserted_rows": inserted_rows,
+        "merged_rows": merged_rows,
         "loaded_at": raw_result.get("loaded_at"),
         "effective_start_timestamp": raw_result.get("effective_start_timestamp"),
         "effective_end_timestamp": raw_result.get("effective_end_timestamp"),
