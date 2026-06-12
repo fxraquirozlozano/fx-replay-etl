@@ -1,6 +1,7 @@
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 GCLOUD_BIN = "gcloud.cmd"
@@ -13,8 +14,8 @@ SCHEDULER_INVOKER_SA = f"cloud-run-invoker@{PROJECT_ID}.iam.gserviceaccount.com"
 @dataclass
 class JobDefinition:
     name: str
-    schedule: str
-    timezone: str
+    schedule: Optional[str]
+    timezone: Optional[str]
     source_dir: Path
     env_vars: dict[str, str]
     handler: callable
@@ -43,10 +44,10 @@ class CloudRunApp:
     def job(
         self,
         name: str,
-        schedule: str,
-        timezone: str,
         source_dir: str,
         env_vars: dict[str, str],
+        schedule: str | None = None,
+        timezone: str | None = None,
         secret_env_vars: dict[str, str] | None = None,
     ):
         def decorator(func):
@@ -143,8 +144,9 @@ def scheduler_command(job: JobDefinition, action: str) -> str:
 
 def commands_for_job(job: JobDefinition) -> list[str]:
     commands = [build_command(job), deploy_command(job)]
-    action = "update" if scheduler_exists(job) else "create"
-    commands.append(scheduler_command(job, action))
+    if job.schedule and job.timezone:
+        action = "update" if scheduler_exists(job) else "create"
+        commands.append(scheduler_command(job, action))
     return commands
 
 

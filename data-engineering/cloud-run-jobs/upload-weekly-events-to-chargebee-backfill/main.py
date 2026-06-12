@@ -4,7 +4,7 @@ import gzip
 import json
 import tempfile
 from io import BytesIO, StringIO, TextIOWrapper
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from google.cloud import bigquery
@@ -16,16 +16,19 @@ PROJECT_ID = os.getenv("GCP_PROJECT", "fxr-analytics")
 DATASET = os.getenv("BQ_DATASET", "sandbox")
 TABLE = os.getenv("BQ_TABLE", "tracking_events_chargebee")
 BUCKET = os.getenv("EXPORT_BUCKET", "fxr-chargebee-exports")
-PREFIX = os.getenv("EXPORT_PREFIX", "tracking_events_chargebee")
+PREFIX = os.getenv("EXPORT_PREFIX", "tracking_events_chargebee_backfill")
 EXPORT_FORMAT = os.getenv("EXPORT_FORMAT", "CSV").upper()
 COMPRESSION = os.getenv("EXPORT_COMPRESSION", "GZIP").upper()
-EXPORT_TIME_ZONE = os.getenv("EXPORT_TIME_ZONE", "America/Chicago")
+EXPORT_START_TS = os.getenv("EXPORT_START_TS", "").strip()
+EXPORT_END_TS = os.getenv("EXPORT_END_TS", "").strip()
 SFTP_HOST = os.getenv("SFTP_HOST", "").strip()
 SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
 SFTP_USER = os.getenv("SFTP_USER", "").strip()
 SFTP_REMOTE_PATH = os.getenv("SFTP_REMOTE_PATH", "usage_data")
 SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "").strip()
 SFTP_BATCH_TIME_ZONE = os.getenv("SFTP_BATCH_TIME_ZONE", "UTC").strip()
+SFTP_BATCH_ID_OVERRIDE = os.getenv("SFTP_BATCH_ID_OVERRIDE", "").strip()
+SFTP_OVERWRITE_BATCH = os.getenv("SFTP_OVERWRITE_BATCH", "false").strip().lower() == "true"
 ROWS_PER_OUTPUT_FILE = int(os.getenv("ROWS_PER_OUTPUT_FILE", "250000"))
 EXPORT_COLUMNS = [
     "subscription_id",
@@ -57,11 +60,12 @@ EXPORT_COLUMNS = [
 ]
 
 
-def weekly_window() -> tuple[str, str]:
-    local_now = datetime.now(ZoneInfo(EXPORT_TIME_ZONE))
-    end_date = local_now.date() - timedelta(days=(local_now.weekday() - 1) % 7)
-    start_date = end_date - timedelta(days=7)
-    return start_date.isoformat(), end_date.isoformat()
+def export_window() -> tuple[str, str]:
+    if not EXPORT_START_TS or not EXPORT_END_TS:
+        raise RuntimeError("EXPORT_START_TS and EXPORT_END_TS are required for backfill jobs.")
+    start_dt = datetime.fromisoformat(EXPORT_START_TS.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(EXPORT_END_TS.replace("Z", "+00:00"))
+    return start_dt.date().isoformat(), end_dt.date().isoformat()
 
 
 def build_destination_uri(start_date: str, end_date: str) -> str:
@@ -72,7 +76,7 @@ def build_destination_uri(start_date: str, end_date: str) -> str:
     )
 
 
-def build_export_sql(destination_uri: str, start_date: str, end_date: str) -> str:
+def build_export_sql(destination_uri: str) -> str:
     options = [
         f"uri='{destination_uri}'",
         f"format='{EXPORT_FORMAT}'",
@@ -93,9 +97,8 @@ def build_export_sql(destination_uri: str, start_date: str, end_date: str) -> st
     END
     """
     selected_columns = ",\n      ".join(EXPORT_COLUMNS)
-
-    start_ts = f"{start_date} 00:00:00+00"
-    end_ts = f"{end_date} 00:00:00+00"
+    start_ts = EXPORT_START_TS.replace("Z", "+00:00")
+    end_ts = EXPORT_END_TS.replace("Z", "+00:00")
 
     return f"""
     EXPORT DATA
@@ -137,37 +140,19 @@ def ensure_remote_dir(sftp: paramiko.SFTPClient, remote_path: str) -> None:
             sftp.mkdir(current)
 
 
-def upload_exports_to_sftp(destination_uri: str) -> list[str]:
-    if not sftp_enabled():
-        raise RuntimeError(
-            "SFTP upload is not configured. Set SFTP_HOST, SFTP_USER, and "
-            "SFTP_PRIVATE_KEY."
-        )
-
-    bucket_prefix = destination_uri.removeprefix("gs://")
-    bucket_name, blob_pattern = bucket_prefix.split("/", 1)
-    blob_prefix = blob_pattern.rsplit("/", 1)[0] + "/"
-    blobs = list_exported_blobs(bucket_name, blob_prefix)
-
-    uploaded_files: list[str] = []
-    sftp, transport = sftp_client()
-    try:
-        ensure_remote_dir(sftp, SFTP_REMOTE_PATH)
-        for blob in blobs:
-            remote_file = f"{SFTP_REMOTE_PATH.rstrip('/')}/{blob.name.rsplit('/', 1)[-1]}"
-            buffer = BytesIO()
-            blob.download_to_file(buffer)
-            buffer.seek(0)
-            sftp.putfo(buffer, remote_file)
-            uploaded_files.append(remote_file)
-    finally:
-        sftp.close()
-        transport.close()
-
-    return uploaded_files
+def clear_remote_dir(sftp: paramiko.SFTPClient, remote_path: str) -> None:
+    for entry in sftp.listdir_attr(remote_path):
+        child_path = f"{remote_path.rstrip('/')}/{entry.filename}"
+        if entry.st_mode & 0o170000 == 0o040000:
+            clear_remote_dir(sftp, child_path)
+            sftp.rmdir(child_path)
+        else:
+            sftp.remove(child_path)
 
 
 def batch_id() -> str:
+    if SFTP_BATCH_ID_OVERRIDE:
+        return SFTP_BATCH_ID_OVERRIDE
     return datetime.now(ZoneInfo(SFTP_BATCH_TIME_ZONE)).strftime("%Y-%m-%d-%H-%M-%S")
 
 
@@ -241,16 +226,8 @@ def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedT
 
         event_timestamp = int(row[2]) if row[2] not in ("", None) else None
         if event_timestamp is not None:
-            min_event_timestamp = (
-                event_timestamp
-                if min_event_timestamp is None
-                else min(min_event_timestamp, event_timestamp)
-            )
-            max_event_timestamp = (
-                event_timestamp
-                if max_event_timestamp is None
-                else max(max_event_timestamp, event_timestamp)
-            )
+            min_event_timestamp = event_timestamp if min_event_timestamp is None else min(min_event_timestamp, event_timestamp)
+            max_event_timestamp = event_timestamp if max_event_timestamp is None else max(max_event_timestamp, event_timestamp)
 
     if current_file is not None:
         current_file.flush()
@@ -271,10 +248,7 @@ def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedT
 
 def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
     if not sftp_enabled():
-        raise RuntimeError(
-            "SFTP upload is not configured. Set SFTP_HOST, SFTP_USER, and "
-            "SFTP_PRIVATE_KEY."
-        )
+        raise RuntimeError("SFTP upload is not configured. Set SFTP_HOST, SFTP_USER, and SFTP_PRIVATE_KEY.")
 
     current_batch_id, part_files, metadata = prepare_batch_files(destination_uri)
     remote_batch_path = f"{SFTP_REMOTE_PATH.rstrip('/')}/{current_batch_id}"
@@ -283,6 +257,8 @@ def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
 
     try:
         ensure_remote_dir(sftp, remote_batch_path)
+        if SFTP_OVERWRITE_BATCH:
+            clear_remote_dir(sftp, remote_batch_path)
 
         for part_file, file_name in zip(part_files, metadata["expected_file_names"]):
             part_file.seek(0)
@@ -307,25 +283,23 @@ def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
 
 
 def main() -> None:
-    start_date, end_date = weekly_window()
+    start_date, end_date = export_window()
     destination_uri = build_destination_uri(start_date, end_date)
-    sql = build_export_sql(destination_uri, start_date, end_date)
-    export_start_ts = f"{start_date} 00:00:00+00"
-    export_end_ts = f"{end_date} 00:00:00+00"
+    sql = build_export_sql(destination_uri)
+    export_start_ts = EXPORT_START_TS.replace("Z", "+00:00")
+    export_end_ts = EXPORT_END_TS.replace("Z", "+00:00")
 
     client = bigquery.Client(project=PROJECT_ID)
-    job = client.query(sql)
-    job.result()
+    client.query(sql).result()
     uploaded_files, metadata = upload_batch_to_sftp(destination_uri)
 
     print(
-        "Export completed",
+        "Backfill export completed",
         {
             "project": PROJECT_ID,
             "source_table": f"{PROJECT_ID}.{DATASET}.{TABLE}",
             "destination_uri": destination_uri,
             "format": EXPORT_FORMAT,
-            "time_zone": EXPORT_TIME_ZONE,
             "week_start": start_date,
             "week_end": end_date,
             "export_start_ts": export_start_ts,

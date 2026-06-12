@@ -69,7 +69,7 @@ def airflow_var(name: str, default: str) -> str:
 
 PROJECT_ID = airflow_var("FXR_POSTGRES_GCP_PROJECT_ID", "fxr-analytics")
 DAG_TIMEZONE = airflow_var("FXR_POSTGRES_DAG_TIMEZONE", "America/Lima")
-SCHEDULE = airflow_var("FXR_POSTGRES_HOURLY_DAG_SCHEDULE", "0 * * * *")
+SCHEDULE = airflow_var("FXR_POSTGRES_BACKFILL_DAG_SCHEDULE", None)
 POSTGRES_SECRET_NAME = airflow_var(
     "FXR_POSTGRES_SECRET_NAME",
     "fxr-postgres-connection",
@@ -89,18 +89,7 @@ FINAL_BQ_DATASET = airflow_var("FXR_POSTGRES_FINAL_BQ_DATASET", "fxr_ugd")
 
 
 TABLE_SPECS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
-    ("indicators", "chart_demo", ("id",), "updated_at"),
-    ("indicators", "indicator_reaction", ("id",), "updated_at"),
-    ("indicators", "pine_script_comment", ("id",), "updated_at"),
-    #("indicators", "indicator_version", ("id",), "updated_at"),
-    ("indicators", "indicator", ("id",), "updated_at"),
-    ("journal", "tag", ("id",), "updated_at"),
-    ("journal", "tag_group", ("id",), "updated_at"),
-    ("journal", "journaled_trade_order", ("id",), "updated_at"),
-    ("journal", "journaled_trade_tag", ("id",), "updated_at"),
-    ("journal", "journaled_trade_file", ("id",), "updated_at"),
-    ("journal", "trading_account", ("id",), "updated_at"),
-    ("journal", "trading_account_transaction", ("id",), "updated_at"),
+    ("indicators", "indicator_version", ("id",), "updated_at"),
 )
 
 
@@ -626,6 +615,107 @@ def resolve_runtime_window(last_timestamp: datetime | None) -> tuple[datetime | 
     return start_timestamp, end_timestamp
 
 
+def get_source_timestamp_bounds(
+    connection,
+    table_config: dict[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    source_incremental_column = table_config["merge_config"]["source_incremental_column"]
+    if source_incremental_column is None:
+        return None, None
+
+    schema_name = validate_identifier(
+        table_config["postgres_schema"],
+        "PostgreSQL schema name",
+    )
+    table_name = validate_identifier(
+        table_config["postgres_table"],
+        "PostgreSQL table name",
+    )
+    updated_column = validate_identifier(
+        source_incremental_column,
+        "incremental source column",
+    )
+    query = f"""
+    SELECT
+      MIN("{updated_column}") AS min_timestamp,
+      MAX("{updated_column}") AS max_timestamp
+    FROM "{schema_name}"."{table_name}"
+    """
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(query)
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def ensure_utc_datetime(value: datetime | str) -> datetime:
+    if isinstance(value, str):
+        value = parse_runtime_timestamp(value)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def resolve_backfill_window(
+    connection,
+    table_config: dict[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    context = get_current_context()
+    conf = (context.get("dag_run") and context["dag_run"].conf) or {}
+
+    source_start, source_end = get_source_timestamp_bounds(connection, table_config)
+    start_timestamp = ensure_utc_datetime(source_start) if source_start else None
+    end_timestamp = ensure_utc_datetime(source_end) if source_end else None
+
+    if conf.get("start_timestamp"):
+        start_timestamp = ensure_utc_datetime(
+            parse_runtime_timestamp(str(conf["start_timestamp"]))
+        )
+    if conf.get("end_timestamp"):
+        end_timestamp = ensure_utc_datetime(
+            parse_runtime_timestamp(str(conf["end_timestamp"]))
+        )
+
+    return start_timestamp, end_timestamp
+
+
+def iter_daily_windows(
+    start_timestamp: datetime | None,
+    end_timestamp: datetime | None,
+) -> list[tuple[datetime | None, datetime | None]]:
+    if start_timestamp is None or end_timestamp is None:
+        return [(start_timestamp, end_timestamp)]
+
+    start_utc = ensure_utc_datetime(start_timestamp)
+    end_utc = ensure_utc_datetime(end_timestamp)
+    if start_utc > end_utc:
+        return []
+
+    windows: list[tuple[datetime, datetime]] = []
+    current = datetime.combine(start_utc.date(), time.min, tzinfo=UTC)
+    final_boundary = datetime.combine(
+        end_utc.date() + timedelta(days=1),
+        time.min,
+        tzinfo=UTC,
+    )
+
+    while current < final_boundary:
+        next_boundary = current + timedelta(days=1)
+        window_start = max(start_utc, current)
+        window_end = min(end_utc, next_boundary - timedelta(microseconds=1))
+        if window_start <= window_end:
+            windows.append((window_start, window_end))
+        current = next_boundary
+
+    return windows
+
+
 def build_postgres_query(
     start_timestamp: datetime | None,
     end_timestamp: datetime | None,
@@ -668,6 +758,44 @@ def build_postgres_query(
         f"WHERE {where_clause} ORDER BY \"{updated_column}\" ASC"
     )
     return query, tuple(params)
+
+
+def load_staging_window_to_jsonl(
+    cursor,
+    raw_schema: list[bigquery.SchemaField],
+    query: str,
+    params: tuple[Any, ...],
+    loaded_at: str,
+    snapshot_file,
+) -> int:
+    cursor.execute(query, params)
+    if cursor.description is None:
+        raise ValueError("PostgreSQL cursor metadata is unavailable after execute.")
+
+    column_names = [column.name for column in cursor.description]
+    total_rows = 0
+
+    while True:
+        batch = cursor.fetchmany(POSTGRES_FETCH_SIZE)
+        if not batch:
+            break
+
+        json_rows = []
+        for record in batch:
+            row = {
+                column_name: normalize_value(value)
+                for column_name, value in zip(column_names, record)
+            }
+            row["_loaded_at"] = loaded_at
+            json_rows.append(coerce_row_to_schema(row, raw_schema))
+
+        for row in json_rows:
+            snapshot_file.write(json.dumps(row, separators=(",", ":")))
+            snapshot_file.write("\n")
+
+        total_rows += len(json_rows)
+
+    return total_rows
 
 
 def normalize_value(value: Any) -> Any:
@@ -856,21 +984,11 @@ def stage_table_raw_to_gcs(
     connection = get_postgres_connection(postgres_config)
 
     try:
-        target_incremental_column = table_config["merge_config"]["target_incremental_column"]
-        last_timestamp = (
-            get_max_table_timestamp(
-                client,
-                final_table_ref,
-                target_incremental_column,
-            )
-            if target_incremental_column
-            else None
-        )
-        start_timestamp, end_timestamp = resolve_runtime_window(last_timestamp)
-        query, params = build_postgres_query(start_timestamp, end_timestamp, table_config)
-
         raw_table = client.get_table(raw_table_ref)
+        start_timestamp, end_timestamp = resolve_backfill_window(connection, table_config)
+        daily_windows = iter_daily_windows(start_timestamp, end_timestamp)
         total_rows = 0
+        staged_gcs_uris: list[str] = []
         run_id = sanitize_gcs_path_component(str(context.get("run_id", "manual")))
         logical_date = context.get("logical_date")
         logical_date_part = (
@@ -878,75 +996,92 @@ def stage_table_raw_to_gcs(
             if isinstance(logical_date, datetime)
             else "no-logical-date"
         )
-        gcs_blob_name = (
-            f"{GCS_STAGING_PREFIX.rstrip('/')}/"
-            f"{table_config['task_name']}/"
-            f"{logical_date_part}/"
-            f"{run_id}.jsonl"
-        )
-        logger.info(
-            "Raw staging target for %s: gs://%s/%s",
-            raw_table_ref,
-            GCS_STAGING_BUCKET,
-            gcs_blob_name,
-        )
-        snapshot_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=f"-{table_config['task_name']}.jsonl",
-            delete=False,
-        )
-        snapshot_file_path = snapshot_file.name
         cursor = connection.cursor()
         cursor.arraysize = POSTGRES_FETCH_SIZE
         try:
-            cursor.execute(query, params)
-            if cursor.description is None:
-                raise ValueError("PostgreSQL cursor metadata is unavailable after execute.")
-            column_names = [column.name for column in cursor.description]
+            if not daily_windows:
+                logger.info("No source rows found for %s", raw_table_ref)
 
-            while True:
-                batch = cursor.fetchmany(POSTGRES_FETCH_SIZE)
-                if not batch:
-                    break
+            for window_start, window_end in daily_windows:
+                query, params = build_postgres_query(
+                    window_start - timedelta(microseconds=1) if window_start else None,
+                    window_end,
+                    table_config,
+                )
+                window_label = (
+                    ensure_utc_datetime(window_start).date().isoformat()
+                    if isinstance(window_start, datetime)
+                    else "full"
+                )
+                gcs_blob_name = (
+                    f"{GCS_STAGING_PREFIX.rstrip('/')}/"
+                    f"{table_config['task_name']}/"
+                    f"{logical_date_part}/"
+                    f"day={window_label}/"
+                    f"{run_id}.jsonl"
+                )
+                logger.info(
+                    "Raw staging target for %s day %s: gs://%s/%s",
+                    raw_table_ref,
+                    window_label,
+                    GCS_STAGING_BUCKET,
+                    gcs_blob_name,
+                )
 
-                json_rows = []
-                for record in batch:
-                    row = {
-                        column_name: normalize_value(value)
-                        for column_name, value in zip(column_names, record)
-                    }
-                    row["_loaded_at"] = loaded_at
-                    json_rows.append(coerce_row_to_schema(row, raw_table.schema))
+                snapshot_file = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=f"-{table_config['task_name']}-{window_label}.jsonl",
+                    delete=False,
+                )
+                snapshot_file_path = snapshot_file.name
+                try:
+                    rows_in_window = load_staging_window_to_jsonl(
+                        cursor,
+                        raw_table.schema,
+                        query,
+                        params,
+                        loaded_at,
+                        snapshot_file,
+                    )
+                finally:
+                    snapshot_file.close()
 
-                for row in json_rows:
-                    snapshot_file.write(json.dumps(row, separators=(",", ":")))
-                    snapshot_file.write("\n")
+                if rows_in_window == 0:
+                    if os.path.exists(snapshot_file_path):
+                        os.unlink(snapshot_file_path)
+                    logger.info(
+                        "No rows found for %s on %s; skipping GCS upload",
+                        raw_table_ref,
+                        window_label,
+                    )
+                    continue
 
-                total_rows += len(json_rows)
-                logger.info("Staged %s rows for %s", total_rows, raw_table_ref)
+                try:
+                    staged_gcs_uri = upload_file_to_gcs(snapshot_file_path, gcs_blob_name)
+                finally:
+                    if os.path.exists(snapshot_file_path):
+                        os.unlink(snapshot_file_path)
+
+                staged_gcs_uris.append(staged_gcs_uri)
+                total_rows += rows_in_window
+                logger.info(
+                    "Uploaded %s rows for %s on %s to %s",
+                    rows_in_window,
+                    raw_table_ref,
+                    window_label,
+                    staged_gcs_uri,
+                )
         finally:
             cursor.close()
-            snapshot_file.close()
-
-        try:
-            staged_gcs_uri = upload_file_to_gcs(snapshot_file_path, gcs_blob_name)
-            logger.info("Uploaded staged rows for %s to %s", raw_table_ref, staged_gcs_uri)
-        finally:
-            if os.path.exists(snapshot_file_path):
-                os.unlink(snapshot_file_path)
 
         return {
             "task_name": table_config["task_name"],
             "target_table": raw_table_ref,
             "final_table": final_table_ref,
             "rows_loaded": total_rows,
-            "staged_gcs_uri": staged_gcs_uri,
-            "last_timestamp": (
-                last_timestamp.isoformat()
-                if isinstance(last_timestamp, datetime)
-                else None
-            ),
+            "staged_gcs_uris": staged_gcs_uris,
+            "window_count": len(daily_windows),
             "effective_start_timestamp": (
                 start_timestamp.isoformat()
                 if isinstance(start_timestamp, datetime)
@@ -971,18 +1106,23 @@ def load_table_raw_from_gcs(
     logger.info("Running DAG revision %s", DAG_REVISION)
     client = get_bq_client()
     raw_table_ref = str(staged_result["target_table"])
-    staged_gcs_uri = str(staged_result["staged_gcs_uri"])
+    staged_gcs_uris = [str(value) for value in staged_result.get("staged_gcs_uris", [])]
     rows_loaded = int(staged_result.get("rows_loaded", 0))
     raw_table = client.get_table(raw_table_ref)
 
     if rows_loaded > 0:
-        load_rows_from_jsonl_uri(
-            client,
-            raw_table_ref,
-            raw_table.schema,
-            staged_gcs_uri,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
+        for index, staged_gcs_uri in enumerate(staged_gcs_uris):
+            load_rows_from_jsonl_uri(
+                client,
+                raw_table_ref,
+                raw_table.schema,
+                staged_gcs_uri,
+                write_disposition=(
+                    bigquery.WriteDisposition.WRITE_TRUNCATE
+                    if index == 0
+                    else bigquery.WriteDisposition.WRITE_APPEND
+                ),
+            )
     else:
         truncate_table(client, raw_table_ref)
 
@@ -991,8 +1131,8 @@ def load_table_raw_from_gcs(
         "target_table": raw_table_ref,
         "final_table": staged_result["final_table"],
         "rows_loaded": rows_loaded,
-        "staged_gcs_uri": staged_gcs_uri,
-        "last_timestamp": staged_result.get("last_timestamp"),
+        "staged_gcs_uris": staged_gcs_uris,
+        "window_count": int(staged_result.get("window_count", 0)),
         "effective_start_timestamp": staged_result.get("effective_start_timestamp"),
         "effective_end_timestamp": staged_result.get("effective_end_timestamp"),
         "loaded_at": staged_result.get("loaded_at"),
@@ -1082,12 +1222,6 @@ def build_final_merge_query(
     insert_values = ",\n      ".join(
         f"source.`{spec['target_name']}`" for spec in specs
     )
-    merge_keys = set(merge_config["join_keys"])
-    update_specs = [spec for spec in specs if spec["target_name"] not in merge_keys]
-    update_clause = ",\n      ".join(
-        f"`{spec['target_name']}` = source.`{spec['target_name']}`"
-        for spec in update_specs
-    )
     partition_clause = ", ".join(
         f"`{value}`" for value in merge_config["partition_by"]
     )
@@ -1099,41 +1233,33 @@ def build_final_merge_query(
         f"target.`{value}` = source.`{value}`"
         for value in merge_config["join_keys"]
     )
-    source_incremental_column = merge_config["source_incremental_column"]
-    target_incremental_column = merge_config["target_incremental_column"]
-    staged_where_clause = ""
-    if source_incremental_column and target_incremental_column:
-        staged_where_clause = f"""
-        WHERE `{source_incremental_column}` > COALESCE(
-          (SELECT MAX(`{target_incremental_column}`) FROM `{final_table_ref}`),
-          TIMESTAMP("1970-01-01 00:00:00+00")
-        )"""
-
     return f"""
-    MERGE `{final_table_ref}` AS target
-    USING (
-      WITH staged AS (
-        SELECT
-          {select_clause}
-        FROM `{raw_table_ref}`
-{staged_where_clause}
-      )
-      SELECT *
-      FROM staged
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY {partition_clause}
-        ORDER BY {order_clause}
-      ) = 1
-    ) AS source
-    ON {on_clause}
-    WHEN MATCHED THEN UPDATE SET
-      {update_clause}
-    WHEN NOT MATCHED THEN INSERT (
+    CREATE TEMP TABLE staged_rows AS
+    WITH staged AS (
+      SELECT
+        {select_clause}
+      FROM `{raw_table_ref}`
+    )
+    SELECT *
+    FROM staged
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY {partition_clause}
+      ORDER BY {order_clause}
+    ) = 1;
+
+    DELETE FROM `{final_table_ref}` AS target
+    WHERE EXISTS (
+      SELECT 1
+      FROM staged_rows AS source
+      WHERE {on_clause}
+    );
+
+    INSERT INTO `{final_table_ref}` (
       {insert_columns}
     )
-    VALUES (
+    SELECT
       {insert_values}
-    )
+    FROM staged_rows AS source
     """
 
 
@@ -1226,10 +1352,10 @@ def build_table_tasks(table_configs: tuple[dict[str, Any], ...]) -> None:
 
 
 with DAG(
-    dag_id="fxr_postgres_to_bigquery_hourly",
+    dag_id="fxr_postgres_to_bigquery_backfill",
     description=(
-        "Carga incremental por hora desde PostgreSQL FXR hacia BigQuery raw y "
-        "final para tablas operativas seleccionadas."
+        "Backfill completo desde PostgreSQL FXR hacia BigQuery raw y final "
+        "para indicator_version, exportando snapshots diarios a GCS."
     ),
     start_date=datetime(2024, 1, 1, 5, 0, tzinfo=ZoneInfo(DAG_TIMEZONE)),
     schedule=SCHEDULE,
@@ -1241,6 +1367,6 @@ with DAG(
         "retries": 2,
         "retry_delay": timedelta(minutes=10),
     },
-    tags=["postgres", "bigquery", "fxr", "incremental", "raw"],
+    tags=["postgres", "bigquery", "fxr", "backfill", "raw"],
 ) as dag:
     build_table_tasks(TABLE_CONFIGS)

@@ -25,6 +25,7 @@ except ImportError:
 from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery
 from google.cloud import secretmanager
+from google.cloud import storage
 
 try:
     import pymysql
@@ -39,7 +40,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _MYSQL_SSL_CA_FILE: str | None = None
-DAG_REVISION = "2026-05-28T16:52:00-emaillead-int64-bool-fix"
+DAG_REVISION = "2026-06-09T10:35:00-merge-backtesting-orders-positions"
 
 
 def airflow_var(name: str, default: str) -> str:
@@ -57,6 +58,11 @@ PROJECT_ID = airflow_var("FXREPLAY_PROD_GCP_PROJECT_ID", "fxr-analytics")
 DAG_TIMEZONE = airflow_var("FXREPLAY_PROD_DAG_TIMEZONE", "America/Lima")
 SCHEDULE = airflow_var("FXREPLAY_PROD_DAG_SCHEDULE", "0 5 * * *")
 FAST_SCHEDULE = airflow_var("FXREPLAY_PROD_FAST_DAG_SCHEDULE", "*/30 * * * *")
+GCS_STAGING_BUCKET = airflow_var("FXREPLAY_PROD_GCS_STAGING_BUCKET", "fx-replay-etl")
+GCS_STAGING_PREFIX = airflow_var(
+    "FXREPLAY_PROD_GCS_STAGING_PREFIX",
+    "tmp/fxreplay_prod_mysql_to_bigquery_daily",
+)
 MYSQL_SECRET_NAME = airflow_var(
     "FXREPLAY_PROD_MYSQL_SECRET_NAME",
     "fxreplay_prod-mysql-connection",
@@ -70,25 +76,6 @@ WATERMARK_LOOKBACK_SECONDS = int(
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
-    {
-        "task_name": "timeanalytic",
-        "mysql_table": "timeanalytic",
-        "raw_bq_dataset": "fxr_ugd_raw",
-        "raw_bq_table": "timeanalytic",
-        "final_bq_dataset": "fxr_ugd",
-        "final_bq_table": "time_analytics",
-        "required_source_columns": ("userId", "date", "updatedAt"),
-        "datetime_from_unix_seconds_columns": ("date",),
-        "merge_config": {
-            "join_keys": ("user_id", "date"),
-            "partition_by": ("user_id", "date"),
-            "order_by": (
-                {"column": "updated_at", "direction": "DESC"},
-            ),
-            "source_incremental_column": "updatedAt",
-            "target_incremental_column": "updated_at",
-        },
-    },
     {
         "task_name": "positions",
         "mysql_table": "position",
@@ -106,47 +93,9 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
             "source_incremental_column": "updatedAt",
+            "source_incremental_fallback_column": "createdAt",
             "target_incremental_column": "updated_at",
-        },
-    },
-    {
-        "task_name": "emaillead",
-        "mysql_table": "emaillead",
-        "raw_bq_dataset": "fxr_ugd_raw",
-        "raw_bq_table": "emaillead",
-        "final_bq_dataset": "fxr_ugd",
-        "final_bq_table": "email_leads",
-        "required_source_columns": ("id", "createdAt"),
-        "datetime_from_unix_seconds_columns": (),
-        "merge_config": {
-            "join_keys": ("id",),
-            "partition_by": ("id",),
-            "order_by": (
-                {"column": "created_at", "direction": "DESC"},
-                {"column": "_loaded_at", "direction": "DESC"},
-            ),
-            "source_incremental_column": "createdAt",
-            "target_incremental_column": "created_at",
-        },
-    },
-    {
-        "task_name": "symbol_library",
-        "mysql_table": "symbollibrary",
-        "raw_bq_dataset": "fxr_ugd_raw",
-        "raw_bq_table": "symbol_library",
-        "final_bq_dataset": "fxr_ugd",
-        "final_bq_table": "symbol_library",
-        "required_source_columns": ("id",),
-        "datetime_from_unix_seconds_columns": (),
-        "merge_config": {
-            "join_keys": ("id",),
-            "partition_by": ("id",),
-            "order_by": (
-                {"column": "_loaded_at", "direction": "DESC"},
-            ),
-            "source_incremental_column": None,
-            "target_incremental_column": None,
-            "delete_not_matched_by_source": True,
+            "target_incremental_fallback_column": "created_at",
         },
     },
     {
@@ -166,28 +115,10 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
             "source_incremental_column": "updatedAt",
+            "source_incremental_fallback_column": "createdAt",
             "target_incremental_column": "updated_at",
+            "target_incremental_fallback_column": "created_at",
             "delete_not_matched_by_source": False,
-        },
-    },
-    {
-        "task_name": "users",
-        "mysql_table": "user",
-        "raw_bq_dataset": "fxr_ugd_raw",
-        "raw_bq_table": "users",
-        "final_bq_dataset": "fxr_ugd",
-        "final_bq_table": "users",
-        "required_source_columns": ("id", "email"),
-        "datetime_from_unix_seconds_columns": (),
-        "merge_config": {
-            "join_keys": ("id",),
-            "partition_by": ("id",),
-            "order_by": (
-                {"column": "_loaded_at", "direction": "DESC"},
-            ),
-            "source_incremental_column": None,
-            "target_incremental_column": None,
-            "delete_not_matched_by_source": True,
         },
     },
     {
@@ -211,14 +142,14 @@ TABLE_CONFIGS: tuple[dict[str, Any], ...] = (
                 {"column": "_loaded_at", "direction": "DESC"},
             ),
             "source_incremental_column": "updatedAt",
+            "source_incremental_fallback_column": "createdAt",
             "target_incremental_column": "updated_at",
+            "target_incremental_fallback_column": "created_at",
             "delete_not_matched_by_source": False,
         },
     },
 )
 
-FAST_TASK_NAMES = {"emaillead", "users"}
-FAST_WINDOW_MINUTES = 30
 DAILY_WINDOW_PREVIOUS_DAY = True
 
 
@@ -281,9 +212,19 @@ def normalize_table_config(table_config: dict[str, Any]) -> dict[str, Any]:
             if merge_config.get("source_incremental_column") not in (None, "")
             else None
         ),
+        "source_incremental_fallback_column": (
+            str(merge_config["source_incremental_fallback_column"])
+            if merge_config.get("source_incremental_fallback_column") not in (None, "")
+            else None
+        ),
         "target_incremental_column": (
             str(merge_config["target_incremental_column"])
             if merge_config.get("target_incremental_column") not in (None, "")
+            else None
+        ),
+        "target_incremental_fallback_column": (
+            str(merge_config["target_incremental_fallback_column"])
+            if merge_config.get("target_incremental_fallback_column") not in (None, "")
             else None
         ),
         "delete_not_matched_by_source": bool(
@@ -299,11 +240,23 @@ def normalize_table_config(table_config: dict[str, Any]) -> dict[str, Any]:
     if not config["merge_config"]["order_by"]:
         raise ValueError(f"Table {config['task_name']!r} must define merge order_by.")
     source_incremental_column = config["merge_config"]["source_incremental_column"]
+    source_incremental_fallback_column = config["merge_config"]["source_incremental_fallback_column"]
     target_incremental_column = config["merge_config"]["target_incremental_column"]
+    target_incremental_fallback_column = config["merge_config"]["target_incremental_fallback_column"]
     if (source_incremental_column is None) != (target_incremental_column is None):
         raise ValueError(
             f"Table {config['task_name']!r} must define both source and target "
             "incremental columns, or neither."
+        )
+    if source_incremental_fallback_column is not None and source_incremental_column is None:
+        raise ValueError(
+            f"Table {config['task_name']!r} cannot define a source incremental "
+            "fallback without a source incremental column."
+        )
+    if target_incremental_fallback_column is not None and target_incremental_column is None:
+        raise ValueError(
+            f"Table {config['task_name']!r} cannot define a target incremental "
+            "fallback without a target incremental column."
         )
     return config
 
@@ -370,6 +323,10 @@ def get_mysql_config() -> dict[str, Any]:
 
 def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
+
+
+def get_gcs_client() -> storage.Client:
+    return storage.Client(project=PROJECT_ID)
 
 
 def get_mysql_ssl_ca_path(mysql_config: dict[str, Any]) -> str | None:
@@ -768,9 +725,8 @@ def resolve_runtime_window(
 
     if previous_day_window and not conf.get("start_timestamp") and not conf.get("end_timestamp"):
         del last_timestamp
-        default_day = ensure_utc_datetime(data_interval_start) or (
-            datetime.now(UTC) - timedelta(days=1)
-        )
+        interval_anchor = ensure_utc_datetime(data_interval_start) or datetime.now(UTC)
+        default_day = interval_anchor - timedelta(days=1)
         return utc_day_start(default_day), utc_next_day_start(default_day)
 
     if (
@@ -822,6 +778,7 @@ def build_mysql_query(
     merge_config = table_config["merge_config"]
     qualified_table_name = f"`{database_name}`.`{table_name}`"
     source_incremental_column = merge_config["source_incremental_column"]
+    source_incremental_fallback_column = merge_config["source_incremental_fallback_column"]
 
     if source_incremental_column is None:
         logger.info("Performing full snapshot load for %s.%s", database_name, table_name)
@@ -831,18 +788,31 @@ def build_mysql_query(
         source_incremental_column,
         "incremental source column",
     )
+    fallback_column = (
+        validate_identifier(
+            source_incremental_fallback_column,
+            "incremental source fallback column",
+        )
+        if source_incremental_fallback_column is not None
+        else None
+    )
+    incremental_expression = (
+        f"COALESCE(`{updated_column}`, `{fallback_column}`)"
+        if fallback_column is not None
+        else f"`{updated_column}`"
+    )
     if start_timestamp is None and end_timestamp is None:
         logger.info("Performing initial load for %s.%s", database_name, table_name)
-        return f"SELECT * FROM {qualified_table_name} ORDER BY `{updated_column}` ASC", ()
+        return f"SELECT * FROM {qualified_table_name} ORDER BY {incremental_expression} ASC", ()
 
     filters: list[str] = []
     params: list[Any] = []
 
     if start_timestamp is not None:
-        filters.append(f"`{updated_column}` >= %s")
+        filters.append(f"{incremental_expression} >= %s")
         params.append(start_timestamp)
     if end_timestamp is not None:
-        filters.append(f"`{updated_column}` < %s")
+        filters.append(f"{incremental_expression} < %s")
         params.append(end_timestamp)
 
     logger.info(
@@ -887,6 +857,10 @@ def chunked(rows: list[dict[str, Any]], size: int):
         yield rows[index:index + size]
 
 
+def sanitize_gcs_path_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "unknown"
+
+
 def load_rows(
     client: bigquery.Client,
     table_ref: str,
@@ -903,6 +877,52 @@ def load_rows(
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
     client.load_table_from_json(rows, table_ref, job_config=job_config).result()
+
+
+def upload_file_to_gcs(file_path: str, blob_name: str) -> str:
+    gcs_client = get_gcs_client()
+    bucket = gcs_client.bucket(GCS_STAGING_BUCKET)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(file_path, content_type="application/x-ndjson")
+    return f"gs://{GCS_STAGING_BUCKET}/{blob_name}"
+
+
+def load_rows_from_jsonl_uri(
+    client: bigquery.Client,
+    table_ref: str,
+    schema: list[bigquery.SchemaField],
+    source_uri: str,
+    write_disposition: str = bigquery.WriteDisposition.WRITE_TRUNCATE,
+) -> None:
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=write_disposition,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+    )
+    client.load_table_from_uri(source_uri, table_ref, job_config=job_config).result()
+
+
+def stage_json_rows_to_gcs(
+    rows: list[dict[str, Any]],
+    blob_name: str,
+) -> str:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".jsonl",
+        delete=False,
+    ) as temp_file:
+        file_path = temp_file.name
+        for row in rows:
+            temp_file.write(json.dumps(row, separators=(",", ":")))
+            temp_file.write("\n")
+
+    try:
+        return upload_file_to_gcs(file_path, blob_name)
+    finally:
+        if os.path.exists(file_path):
+            os.unlink(file_path)
 
 
 def truncate_table(client: bigquery.Client, table_ref: str) -> None:
@@ -958,25 +978,33 @@ def sync_table_schemas(table_config: dict[str, Any]) -> dict[str, Any]:
         connection.close()
 
 
-def sync_table_raw(
+def export_table_to_gcs(
     schema_result: dict[str, Any],
     table_config: dict[str, Any],
 ) -> dict[str, Any]:
     table_config = normalize_table_config(table_config)
     logger.info("Running DAG revision %s", DAG_REVISION)
-    client = get_bq_client()
-    raw_table_ref = str(schema_result["raw_table"])
+    context = get_current_context()
     final_table_ref = str(schema_result["final_table"])
     loaded_at = datetime.now(UTC).isoformat()
     mysql_config = get_mysql_config()
     connection = get_mysql_connection(mysql_config)
 
     try:
-        raw_table = client.get_table(raw_table_ref)
+        mysql_columns = fetch_mysql_columns(connection, mysql_config, table_config)
+        raw_bool_columns = {
+            str(column["source_name"])
+            for column in mysql_columns
+            if map_mysql_type_to_bigquery(
+                str(column["data_type"]),
+                column["numeric_scale"],
+                column.get("column_type"),
+            ) == "BOOL"
+        }
         target_incremental_column = table_config["merge_config"]["target_incremental_column"]
         last_timestamp = (
             get_max_table_timestamp(
-                client,
+                get_bq_client(),
                 final_table_ref,
                 target_incremental_column,
             )
@@ -995,8 +1023,15 @@ def sync_table_raw(
             table_config,
         )
 
-        truncate_table(client, raw_table_ref)
         total_rows = 0
+        staged_chunk_uris: list[str] = []
+        run_id = sanitize_gcs_path_component(str(context.get("run_id", "manual")))
+        logical_date = context.get("logical_date")
+        logical_date_part = (
+            sanitize_gcs_path_component(str(logical_date.isoformat()))
+            if isinstance(logical_date, datetime)
+            else "no-logical-date"
+        )
         cursor = connection.cursor()
         try:
             cursor.execute(query, params)
@@ -1010,31 +1045,49 @@ def sync_table_raw(
                 json_rows = []
                 for record in batch:
                     row = {
-                        column_name: normalize_value(value)
+                        column_name: (
+                            bool(value)
+                            if column_name in raw_bool_columns and value is not None
+                            else normalize_value(value)
+                        )
                         for column_name, value in zip(column_names, record)
                     }
                     row["_loaded_at"] = loaded_at
                     json_rows.append(row)
 
                 for load_batch in chunked(json_rows, BQ_LOAD_BATCH_SIZE):
-                    load_rows(
-                        client,
-                        raw_table_ref,
-                        raw_table.schema,
-                        load_batch,
-                        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                    chunk_index = len(staged_chunk_uris) + 1
+                    gcs_blob_name = (
+                        f"{GCS_STAGING_PREFIX.rstrip('/')}/"
+                        f"{table_config['task_name']}/"
+                        f"{logical_date_part}/"
+                        f"{run_id}/"
+                        f"chunk-{chunk_index:05d}.jsonl"
                     )
+                    source_uri = stage_json_rows_to_gcs(
+                        load_batch,
+                        gcs_blob_name,
+                    )
+                    staged_chunk_uris.append(source_uri)
 
                 total_rows += len(json_rows)
-                logger.info("Loaded %s rows into %s", total_rows, raw_table_ref)
+                logger.info("Exported %s rows for %s to GCS", total_rows, table_config["task_name"])
         finally:
             cursor.close()
 
         return {
             "task_name": table_config["task_name"],
-            "target_table": raw_table_ref,
+            "target_table": str(schema_result["raw_table"]),
             "final_table": final_table_ref,
             "rows_loaded": total_rows,
+            "staged_chunk_count": len(staged_chunk_uris),
+            "chunk_uris": staged_chunk_uris,
+            "first_staged_chunk_uri": (
+                staged_chunk_uris[0] if staged_chunk_uris else None
+            ),
+            "last_staged_chunk_uri": (
+                staged_chunk_uris[-1] if staged_chunk_uris else None
+            ),
             "last_timestamp": (
                 last_timestamp.isoformat()
                 if isinstance(last_timestamp, datetime)
@@ -1054,6 +1107,56 @@ def sync_table_raw(
         }
     finally:
         connection.close()
+
+
+def load_gcs_to_raw(
+    export_result: dict[str, Any],
+    table_config: dict[str, Any],
+) -> dict[str, Any]:
+    table_config = normalize_table_config(table_config)
+    logger.info("Running DAG revision %s", DAG_REVISION)
+    client = get_bq_client()
+    raw_table_ref = str(export_result["target_table"])
+    raw_table = client.get_table(raw_table_ref)
+
+    chunk_uris = [
+        str(value)
+        for value in (
+            export_result.get("chunk_uris")
+            or []
+        )
+        if value
+    ]
+    if not chunk_uris:
+        truncate_table(client, raw_table_ref)
+    else:
+        for index, source_uri in enumerate(chunk_uris):
+            load_rows_from_jsonl_uri(
+                client,
+                raw_table_ref,
+                raw_table.schema,
+                source_uri,
+                write_disposition=(
+                    bigquery.WriteDisposition.WRITE_TRUNCATE
+                    if index == 0
+                    else bigquery.WriteDisposition.WRITE_APPEND
+                ),
+            )
+
+    return {
+        "task_name": table_config["task_name"],
+        "target_table": raw_table_ref,
+        "final_table": str(export_result["final_table"]),
+        "rows_loaded": int(export_result.get("rows_loaded", 0)),
+        "staged_chunk_count": int(export_result.get("staged_chunk_count", 0)),
+        "first_staged_chunk_uri": export_result.get("first_staged_chunk_uri"),
+        "last_staged_chunk_uri": export_result.get("last_staged_chunk_uri"),
+        "chunk_uris": chunk_uris,
+        "last_timestamp": export_result.get("last_timestamp"),
+        "effective_start_timestamp": export_result.get("effective_start_timestamp"),
+        "effective_end_timestamp": export_result.get("effective_end_timestamp"),
+        "loaded_at": export_result.get("loaded_at"),
+    }
 
 
 def build_final_merge_query(
@@ -1117,12 +1220,24 @@ def build_final_merge_query(
         for value in merge_config["join_keys"]
     )
     source_incremental_column = merge_config["source_incremental_column"]
+    source_incremental_fallback_column = merge_config["source_incremental_fallback_column"]
     target_incremental_column = merge_config["target_incremental_column"]
+    target_incremental_fallback_column = merge_config["target_incremental_fallback_column"]
     staged_where_clause = ""
     if source_incremental_column and target_incremental_column:
+        source_incremental_expression = (
+            f"COALESCE(`{source_incremental_column}`, `{source_incremental_fallback_column}`)"
+            if source_incremental_fallback_column
+            else f"`{source_incremental_column}`"
+        )
+        target_incremental_expression = (
+            f"COALESCE(`{target_incremental_column}`, `{target_incremental_fallback_column}`)"
+            if target_incremental_fallback_column
+            else f"`{target_incremental_column}`"
+        )
         staged_where_clause = f"""
-        WHERE `{source_incremental_column}` > COALESCE(
-          (SELECT MAX(`{target_incremental_column}`) FROM `{final_table_ref}`),
+        WHERE {source_incremental_expression} > COALESCE(
+          (SELECT MAX({target_incremental_expression}) FROM `{final_table_ref}`),
           TIMESTAMP("1970-01-01 00:00:00+00")
         )"""
     delete_not_matched_clause = (
@@ -1217,9 +1332,9 @@ def delete_final_window(
 ) -> int | None:
     target_incremental_column = table_config["merge_config"]["target_incremental_column"]
     if target_incremental_column is None:
-        raise ValueError(
-            f"Daily delete requires target_incremental_column for {final_table_ref}."
-        )
+        job = client.query(f"DELETE FROM `{final_table_ref}` WHERE TRUE")
+        job.result()
+        return job.num_dml_affected_rows
 
     normalized_start = ensure_utc_datetime(start_timestamp)
     normalized_end = ensure_utc_datetime(end_timestamp)
@@ -1233,7 +1348,9 @@ def delete_final_window(
             f"`{target_incremental_column}` < TIMESTAMP('{normalized_end.isoformat().replace('+00:00', 'Z')}')"
         )
     if not filters:
-        raise ValueError(f"Daily delete window is required for {final_table_ref}.")
+        job = client.query(f"DELETE FROM `{final_table_ref}` WHERE TRUE")
+        job.result()
+        return job.num_dml_affected_rows
 
     query = f"""
     DELETE FROM `{final_table_ref}`
@@ -1242,6 +1359,67 @@ def delete_final_window(
     job = client.query(query)
     job.result()
     return job.num_dml_affected_rows
+
+
+def delete_insert_table_to_final(
+    raw_result: dict[str, Any],
+    table_config: dict[str, Any],
+) -> dict[str, Any]:
+    table_config = normalize_table_config(table_config)
+    logger.info("Running DAG revision %s", DAG_REVISION)
+    client = get_bq_client()
+    raw_table_ref = str(raw_result["target_table"])
+    final_table_ref = str(raw_result["final_table"])
+    mysql_config = get_mysql_config()
+    connection = get_mysql_connection(mysql_config)
+    try:
+        mysql_columns = fetch_mysql_columns(connection, mysql_config, table_config)
+    finally:
+        connection.close()
+
+    final_table = reconcile_table_schema(
+        client,
+        final_table_ref,
+        build_final_schema(mysql_columns, table_config),
+    )
+    final_field_types = {
+        field.name: str(field.field_type).upper()
+        for field in final_table.schema
+    }
+    delete_count = delete_final_window(
+        client,
+        final_table_ref,
+        table_config,
+        parse_runtime_timestamp(str(raw_result["effective_start_timestamp"]))
+        if raw_result.get("effective_start_timestamp")
+        else None,
+        parse_runtime_timestamp(str(raw_result["effective_end_timestamp"]))
+        if raw_result.get("effective_end_timestamp")
+        else None,
+    )
+    query = build_final_insert_query(
+        mysql_columns,
+        raw_table_ref,
+        final_table_ref,
+        table_config,
+        final_field_types,
+    )
+    job = client.query(query)
+    job.result()
+    inserted_rows = job.num_dml_affected_rows
+
+    return {
+        "task_name": table_config["task_name"],
+        "raw_table": raw_table_ref,
+        "final_table": final_table_ref,
+        "raw_rows_loaded": int(raw_result.get("rows_loaded", 0)),
+        "deleted_rows": delete_count,
+        "inserted_rows": inserted_rows,
+        "merged_rows": None,
+        "loaded_at": raw_result.get("loaded_at"),
+        "effective_start_timestamp": raw_result.get("effective_start_timestamp"),
+        "effective_end_timestamp": raw_result.get("effective_end_timestamp"),
+    }
 
 
 def merge_table_to_final(
@@ -1269,52 +1447,24 @@ def merge_table_to_final(
         field.name: str(field.field_type).upper()
         for field in final_table.schema
     }
-    target_incremental_column = table_config["merge_config"]["target_incremental_column"]
-    delete_count: int | None = None
-    inserted_rows: int | None = None
-    merged_rows: int | None = None
-
-    if target_incremental_column:
-        delete_count = delete_final_window(
-            client,
-            final_table_ref,
-            table_config,
-            parse_runtime_timestamp(str(raw_result["effective_start_timestamp"]))
-            if raw_result.get("effective_start_timestamp")
-            else None,
-            parse_runtime_timestamp(str(raw_result["effective_end_timestamp"]))
-            if raw_result.get("effective_end_timestamp")
-            else None,
-        )
-        query = build_final_insert_query(
-            mysql_columns,
-            raw_table_ref,
-            final_table_ref,
-            table_config,
-            final_field_types,
-        )
-        job = client.query(query)
-        job.result()
-        inserted_rows = job.num_dml_affected_rows
-    else:
-        query = build_final_merge_query(
-            mysql_columns,
-            raw_table_ref,
-            final_table_ref,
-            table_config,
-            final_field_types,
-        )
-        job = client.query(query)
-        job.result()
-        merged_rows = job.num_dml_affected_rows
+    query = build_final_merge_query(
+        mysql_columns,
+        raw_table_ref,
+        final_table_ref,
+        table_config,
+        final_field_types,
+    )
+    job = client.query(query)
+    job.result()
+    merged_rows = job.num_dml_affected_rows
 
     return {
         "task_name": table_config["task_name"],
         "raw_table": raw_table_ref,
         "final_table": final_table_ref,
         "raw_rows_loaded": int(raw_result.get("rows_loaded", 0)),
-        "deleted_rows": delete_count,
-        "inserted_rows": inserted_rows,
+        "deleted_rows": None,
+        "inserted_rows": None,
         "merged_rows": merged_rows,
         "loaded_at": raw_result.get("loaded_at"),
         "effective_start_timestamp": raw_result.get("effective_start_timestamp"),
@@ -1330,18 +1480,26 @@ def build_table_tasks(table_configs: tuple[dict[str, Any], ...]) -> None:
         sync_schema_task = task(task_id=f"sync_{task_suffix}_schemas")(
             sync_table_schemas
         )(normalized_config)
-        sync_raw_task = task(task_id=f"sync_{task_suffix}_raw")(sync_table_raw)(
+        export_gcs_task = task(task_id=f"export_{task_suffix}_to_gcs")(
+            export_table_to_gcs
+        )(
             sync_schema_task,
+            normalized_config,
+        )
+        load_raw_task = task(task_id=f"load_{task_suffix}_raw")(
+            load_gcs_to_raw
+        )(
+            export_gcs_task,
             normalized_config,
         )
         merge_final_task = task(task_id=f"merge_{task_suffix}_to_final")(
             merge_table_to_final
         )(
-            sync_raw_task,
+            load_raw_task,
             normalized_config,
         )
 
-        sync_schema_task >> sync_raw_task >> merge_final_task
+        sync_schema_task >> export_gcs_task >> load_raw_task >> merge_final_task
 
 
 def create_pipeline_dag(
@@ -1382,13 +1540,13 @@ def create_pipeline_dag(
 
 
 dag = create_pipeline_dag(
-    dag_id="fxreplay_prod_mysql_to_bigquery_daily",
+    dag_id="fxreplay_prod_mysql_merge_backtesting_orders_positions_to_bigquery_daily",
     description=(
-        "Carga incremental diaria de multiples tablas de fxreplay_prod hacia "
-        "BigQuery raw y final."
+        "Carga incremental diaria de backtesting_sessions, orders y positions "
+        "de fxreplay_prod hacia BigQuery raw y final usando merge."
     ),
     schedule=SCHEDULE,
-    tags=["mysql", "bigquery", "fxreplay-prod", "raw", "daily"],
+    tags=["mysql", "bigquery", "fxreplay-prod", "raw", "daily", "merge"],
     table_configs=tuple(
         normalize_table_config(
             {
@@ -1397,6 +1555,5 @@ dag = create_pipeline_dag(
             }
         )
         for table_config in TABLE_CONFIGS
-        if str(table_config["task_name"]) not in FAST_TASK_NAMES
     ),
 )

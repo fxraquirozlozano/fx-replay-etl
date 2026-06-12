@@ -13,8 +13,8 @@ app = CloudRunApp()
 
 @app.job(
     "refresh-daily-tracking-events-chargebee",
-    schedule="0 8 * * *",
-    timezone="America/Chicago",
+    schedule="0 1 * * *",
+    timezone="UTC",
     source_dir="data-engineering/cloud-run-jobs/refresh-daily-tracking-events-chargebee",
     env_vars={
         "GCP_PROJECT": PROJECT_ID,
@@ -24,7 +24,7 @@ app = CloudRunApp()
         "USERS_TABLE": "dim_user",
         "TARGET_DATASET": "sandbox",
         "TARGET_TABLE": "tracking_events_chargebee",
-        "PROCESS_TIME_ZONE": "America/Chicago",
+        "PROCESS_TIME_ZONE": "UTC",
     },
 )
 def refresh_daily_tracking_events_chargebee(event=None):
@@ -88,6 +88,37 @@ def upload_weekly_usage_events_to_chargebee(event=None):
 )
 def load_weekly_chargebee_predictions_from_sftp(event=None):
     """Fetch the latest Chargebee predictions batch from SFTP and load it into BigQuery."""
+    return event
+
+
+@app.job(
+    "upload-weekly-events-to-chargebee-backfill",
+    source_dir="data-engineering/cloud-run-jobs/upload-weekly-events-to-chargebee-backfill",
+    env_vars={
+        "GCP_PROJECT": PROJECT_ID,
+        "BQ_DATASET": "sandbox",
+        "BQ_TABLE": "tracking_events_chargebee",
+        "EXPORT_BUCKET": "fxr-chargebee-exports",
+        "EXPORT_PREFIX": "tracking_events_chargebee_backfill",
+        "EXPORT_FORMAT": "CSV",
+        "EXPORT_COMPRESSION": "GZIP",
+        "EXPORT_START_TS": "",
+        "EXPORT_END_TS": "",
+        "SFTP_BATCH_TIME_ZONE": "UTC",
+        "SFTP_BATCH_ID_OVERRIDE": "",
+        "SFTP_OVERWRITE_BATCH": "false",
+        "SFTP_PORT": "22",
+        "SFTP_REMOTE_PATH": "usage_data",
+        "ROWS_PER_OUTPUT_FILE": "250000",
+    },
+    secret_env_vars={
+        "SFTP_HOST": "chargebee-sftp-host-runtime",
+        "SFTP_USER": "chargebee-sftp-user-runtime",
+        "SFTP_PRIVATE_KEY": "chargebee-sftp-private-key",
+    },
+)
+def upload_weekly_events_to_chargebee_backfill(event=None):
+    """Manual backfill job for Chargebee usage events with explicit UTC timestamps."""
     return event
 
 

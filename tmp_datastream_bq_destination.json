@@ -1,0 +1,7 @@
+{
+  "singleTargetDataset": {
+    "datasetId": "fxr-analytics:fxreplay_prod"
+  },
+  "merge": {},
+  "dataFreshness": "900s"
+}

@@ -12,7 +12,7 @@ USERS_DATASET = os.getenv("USERS_DATASET", "dbt_cloud")
 USERS_TABLE = os.getenv("USERS_TABLE", "dim_user")
 TARGET_DATASET = os.getenv("TARGET_DATASET", "sandbox")
 TARGET_TABLE = os.getenv("TARGET_TABLE", "tracking_events_chargebee")
-PROCESS_TIME_ZONE = os.getenv("PROCESS_TIME_ZONE", "America/Chicago")
+PROCESS_TIME_ZONE = os.getenv("PROCESS_TIME_ZONE", "UTC")
 
 TARGET_SCHEMA = """
 CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}` (

@@ -99,7 +99,7 @@ TABLE_SPECS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     ("journal", "journaled_trade_file", ("id",), "updated_at"),
     ("journal", "trading_account", ("id",), "updated_at"),
     ("journal", "trading_account_transaction", ("id",), "updated_at"),
-    ("indicators", "indicator_version", ("id",), "updated_at"),
+    #("indicators", "indicator_version", ("id",), "updated_at"),
     ("indicators", "indicator", ("id",), "updated_at"),
 )
 
@@ -1082,12 +1082,6 @@ def build_final_merge_query(
     insert_values = ",\n      ".join(
         f"source.`{spec['target_name']}`" for spec in specs
     )
-    merge_keys = set(merge_config["join_keys"])
-    update_specs = [spec for spec in specs if spec["target_name"] not in merge_keys]
-    update_clause = ",\n      ".join(
-        f"`{spec['target_name']}` = source.`{spec['target_name']}`"
-        for spec in update_specs
-    )
     partition_clause = ", ".join(
         f"`{value}`" for value in merge_config["partition_by"]
     )
@@ -1110,30 +1104,33 @@ def build_final_merge_query(
         )"""
 
     return f"""
-    MERGE `{final_table_ref}` AS target
-    USING (
-      WITH staged AS (
-        SELECT
-          {select_clause}
-        FROM `{raw_table_ref}`
+    CREATE TEMP TABLE staged_rows AS
+    WITH staged AS (
+      SELECT
+        {select_clause}
+      FROM `{raw_table_ref}`
 {staged_where_clause}
-      )
-      SELECT *
-      FROM staged
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY {partition_clause}
-        ORDER BY {order_clause}
-      ) = 1
-    ) AS source
-    ON {on_clause}
-    WHEN MATCHED THEN UPDATE SET
-      {update_clause}
-    WHEN NOT MATCHED THEN INSERT (
+    )
+    SELECT *
+    FROM staged
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY {partition_clause}
+      ORDER BY {order_clause}
+    ) = 1;
+
+    DELETE FROM `{final_table_ref}` AS target
+    WHERE EXISTS (
+      SELECT 1
+      FROM staged_rows AS source
+      WHERE {on_clause}
+    );
+
+    INSERT INTO `{final_table_ref}` (
       {insert_columns}
     )
-    VALUES (
+    SELECT
       {insert_values}
-    )
+    FROM staged_rows AS source
     """
 
 
