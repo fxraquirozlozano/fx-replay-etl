@@ -1,0 +1,402 @@
+[
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "indicators",
+          "table": "chart_demo"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "indicators",
+          "table": "indicator"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "indicators",
+          "table": "indicator_reaction"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "indicators",
+          "table": "indicator_version"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "indicators",
+          "table": "pine_script_comment"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "journaled_trade"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "journaled_trade_file"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "journaled_trade_order"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "journaled_trade_tag"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "tag"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "tag_group"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "trading_account"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "journal",
+          "table": "trading_account_transaction"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "event"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "feedback_issue_tag"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "master_event_catalog"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "pixel_strategy_event_log"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "pseudo_user"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "session_feedback"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "postgresqlIdentifier": {
+          "schema": "tracking_prod",
+          "table": "user"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "created_at",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  }
+]
