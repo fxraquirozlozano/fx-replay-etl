@@ -12,6 +12,43 @@ app = CloudRunApp()
 
 
 @app.job(
+    "monthly-vat-report",
+    schedule="0 15 1 * *",
+    timezone="UTC",
+    source_dir="data-engineering/cloud-run-jobs/monthly-vat-report",
+    memory="1Gi",
+    task_timeout="30m",
+    task_max_retries=1,
+    require_all_secrets=True,
+    env_vars={
+        "GCP_PROJECT": PROJECT_ID,
+        "BQ_DATASET": "reporting",
+        "SOURCE_TABLE": "fct_invoices",
+        "SNAPSHOT_TABLE": "vat_report_monthly_snapshots",
+        "BUSINESS_TIMEZONE": "America/Chicago",
+        "REPORT_MONTH": "",
+        "SOURCE_AS_OF": "",
+        "REFRESH_SNAPSHOT": "false",
+        "SHAREPOINT_HOSTNAME": "fxreplay.sharepoint.com",
+        "SHAREPOINT_SITE_PATH": "sites/DataTeam",
+        "SHAREPOINT_DRIVE_ID": "b!Mi_zgpjDy0apgS3ExKpIDJsXOuxMNwRKj7LzgT7nHqaDTMP01zt1R6i62KC3eata",
+        "SHAREPOINT_FOLDER_PATH": "Finance/VAT Report",
+        "OVERWRITE_EXISTING": "true",
+        "REQUEST_TIMEOUT_SECONDS": "120",
+        "DRY_RUN": "false",
+    },
+    secret_env_vars={
+        "TENANT_ID": "sharepoint-tenant-id-runtime",
+        "CLIENT_ID": "sharepoint-client-id-runtime",
+        "CLIENT_SECRET": "sharepoint-client-secret-runtime",
+    },
+)
+def monthly_vat_report(event=None):
+    """Snapshot invoice-date Net Billing and upload the VAT report."""
+    return event
+
+
+@app.job(
     "refresh-daily-tracking-events-chargebee",
     schedule="0 1 * * *",
     timezone="UTC",
