@@ -13,6 +13,13 @@ USERS_TABLE = os.getenv("USERS_TABLE", "dim_user")
 TARGET_DATASET = os.getenv("TARGET_DATASET", "sandbox")
 TARGET_TABLE = os.getenv("TARGET_TABLE", "tracking_events_chargebee")
 PROCESS_TIME_ZONE = os.getenv("PROCESS_TIME_ZONE", "UTC")
+LOOKBACK_DAYS = int(os.getenv("PROCESS_LOOKBACK_DAYS", "3"))
+MIN_ROWS_PER_DAY = int(os.getenv("MIN_ROWS_PER_DAY", "100000"))
+
+if LOOKBACK_DAYS < 1:
+    raise ValueError("PROCESS_LOOKBACK_DAYS must be at least 1")
+if MIN_ROWS_PER_DAY < 0:
+    raise ValueError("MIN_ROWS_PER_DAY cannot be negative")
 
 TARGET_SCHEMA = """
 CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}` (
@@ -49,15 +56,26 @@ CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}` (
 def date_window() -> tuple[str, str]:
     local_now = datetime.now(ZoneInfo(PROCESS_TIME_ZONE))
     end_date = local_now.date()
-    start_date = end_date - timedelta(days=1)
+    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
     return start_date.isoformat(), end_date.isoformat()
 
 
-def query_params(start_date: str, end_date: str) -> list[bigquery.ScalarQueryParameter]:
-    return [
+def query_params(
+    start_date: str,
+    end_date: str,
+    include_min_rows: bool = False,
+) -> list[bigquery.ScalarQueryParameter]:
+    params = [
         bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
         bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
     ]
+    if include_min_rows:
+        params.append(
+            bigquery.ScalarQueryParameter(
+                "min_rows_per_day", "INT64", MIN_ROWS_PER_DAY
+            )
+        )
+    return params
 
 
 def run_query(
@@ -79,50 +97,17 @@ def create_target_table(client: bigquery.Client) -> None:
     run_query(client, query)
 
 
-def delete_target_day(client: bigquery.Client, start_date: str, end_date: str) -> None:
-    target = f"`{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}`"
-    query = f"""
-    DELETE FROM {target}
-    WHERE DATE(TIMESTAMP_MILLIS(timestamp), '{PROCESS_TIME_ZONE}') >= @start_date
-      AND DATE(TIMESTAMP_MILLIS(timestamp), '{PROCESS_TIME_ZONE}') < @end_date
-    """
-    run_query(client, query, query_params(start_date, end_date))
-
-
-def insert_target_day(client: bigquery.Client, start_date: str, end_date: str):
+def refresh_target_window(
+    client: bigquery.Client,
+    start_date: str,
+    end_date: str,
+) -> dict[str, int]:
     source = f"`{PROJECT_ID}.{SOURCE_DATASET}.{SOURCE_TABLE}`"
     users = f"`{PROJECT_ID}.{USERS_DATASET}.{USERS_TABLE}`"
     target = f"`{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}`"
 
     query = f"""
-    INSERT INTO {target} (
-      subscription_id,
-      subscription_plan,
-      timestamp,
-      event_type,
-      customer_id,
-      user_id,
-      is_session_created,
-      is_quick_buy_sell,
-      is_partials_taken,
-      is_position_managed,
-      is_replay_activated,
-      is_news_visibility_clicked,
-      is_order_placed,
-      created_session_type,
-      quick_buy_sell_type,
-      partials_taken_percentage,
-      partials_taken_position_amount_type,
-      position_managed_type,
-      order_has_auto_be,
-      order_has_object_selected,
-      order_has_stop_loss,
-      order_tag_count,
-      order_has_tag_selected,
-      order_has_take_profit,
-      order_take_profit_type,
-      order_save_type
-    )
+    CREATE TEMP TABLE staged_events AS
     WITH events AS (
       SELECT
         user_id,
@@ -234,18 +219,62 @@ def insert_target_day(client: bigquery.Client, start_date: str, end_date: str):
     FROM events e
     INNER JOIN users u
       ON e.user_id = u.user_id
-    """
-    job = client.query(
-        query,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=query_params(start_date, end_date)
-        ),
+    ;
+
+    CREATE TEMP TABLE staged_counts AS
+    WITH expected_dates AS (
+      SELECT event_date
+      FROM UNNEST(
+        GENERATE_DATE_ARRAY(@start_date, DATE_SUB(@end_date, INTERVAL 1 DAY))
+      ) AS event_date
+    ),
+    actual_counts AS (
+      SELECT
+        DATE(TIMESTAMP_MILLIS(timestamp), '{PROCESS_TIME_ZONE}') AS event_date,
+        COUNT(*) AS row_count
+      FROM staged_events
+      GROUP BY event_date
     )
-    job.result()
-    return job.num_dml_affected_rows
+    SELECT
+      expected_dates.event_date,
+      COALESCE(actual_counts.row_count, 0) AS row_count
+    FROM expected_dates
+    LEFT JOIN actual_counts USING (event_date)
+    ;
+
+    ASSERT @min_rows_per_day = 0 OR NOT EXISTS (
+      SELECT 1
+      FROM staged_counts
+      WHERE row_count < @min_rows_per_day
+    ) AS 'Source validation failed: one or more days are below MIN_ROWS_PER_DAY';
+
+    BEGIN TRANSACTION;
+
+    DELETE FROM {target}
+    WHERE DATE(TIMESTAMP_MILLIS(timestamp), '{PROCESS_TIME_ZONE}') >= @start_date
+      AND DATE(TIMESTAMP_MILLIS(timestamp), '{PROCESS_TIME_ZONE}') < @end_date;
+
+    INSERT INTO {target}
+    SELECT *
+    FROM staged_events;
+
+    COMMIT TRANSACTION;
+
+    SELECT event_date, row_count
+    FROM staged_counts
+    ORDER BY event_date;
+    """
+    rows = list(
+        run_query(
+            client,
+            query,
+            query_params(start_date, end_date, include_min_rows=True),
+        )
+    )
+    return {row["event_date"].isoformat(): row["row_count"] for row in rows}
 
 
-def count_target_day(client: bigquery.Client, start_date: str, end_date: str) -> int:
+def count_target_window(client: bigquery.Client, start_date: str, end_date: str) -> int:
     target = f"`{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}`"
     query = f"""
     SELECT COUNT(*) AS row_count
@@ -262,9 +291,8 @@ def main() -> None:
     client = bigquery.Client(project=PROJECT_ID)
 
     create_target_table(client)
-    delete_target_day(client, start_date, end_date)
-    inserted_rows = insert_target_day(client, start_date, end_date)
-    final_rows = count_target_day(client, start_date, end_date)
+    rows_by_date = refresh_target_window(client, start_date, end_date)
+    final_rows = count_target_window(client, start_date, end_date)
 
     print(
         "Daily refresh completed",
@@ -273,10 +301,13 @@ def main() -> None:
             "source_table": f"{PROJECT_ID}.{SOURCE_DATASET}.{SOURCE_TABLE}",
             "target_table": f"{PROJECT_ID}.{TARGET_DATASET}.{TARGET_TABLE}",
             "time_zone": PROCESS_TIME_ZONE,
+            "lookback_days": LOOKBACK_DAYS,
+            "min_rows_per_day": MIN_ROWS_PER_DAY,
             "start_date": start_date,
             "end_date": end_date,
-            "inserted_rows": inserted_rows,
-            "final_rows_for_day": final_rows,
+            "rows_by_date": rows_by_date,
+            "inserted_rows": sum(rows_by_date.values()),
+            "final_rows_for_window": final_rows,
         },
     )
 

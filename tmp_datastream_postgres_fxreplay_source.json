@@ -1,0 +1,55 @@
+{
+  "includeObjects": {
+    "postgresqlSchemas": [
+      {
+        "schema": "indicators",
+        "postgresqlTables": [
+          { "table": "chart_demo" },
+          { "table": "indicator_reaction" },
+          { "table": "pine_script_comment" },
+          { "table": "indicator_version" },
+          { "table": "indicator" }
+        ]
+      },
+      {
+        "schema": "journal",
+        "postgresqlTables": [
+          { "table": "journaled_trade" },
+          { "table": "tag" },
+          { "table": "tag_group" },
+          { "table": "journaled_trade_order" },
+          { "table": "journaled_trade_tag" },
+          { "table": "journaled_trade_file" },
+          { "table": "trading_account" },
+          { "table": "trading_account_transaction" }
+        ]
+      },
+      {
+        "schema": "tracking_prod",
+        "postgresqlTables": [
+          { "table": "feedback_issue_tag" },
+          { "table": "master_event_catalog" },
+          { "table": "migrations" },
+          { "table": "pixel_strategy_event_log" },
+          { "table": "product_feedback" },
+          { "table": "product_feedback_type" },
+          { "table": "session_feedback" },
+          { "table": "session_feedback_issue" },
+          { "table": "signup_attribution" },
+          { "table": "touchpoints" },
+          { "table": "user" },
+          { "table": "user_identity_links" },
+          { "table": "pseudo_user" }
+        ]
+      },
+      {
+        "schema": "auth_identity",
+        "postgresqlTables": [
+          { "table": "registered_device" }
+        ]
+      }
+    ]
+  },
+  "replicationSlot": "datastream_fxr_slot",
+  "publication": "datastream_fxr_pub"
+}

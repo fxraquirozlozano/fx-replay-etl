@@ -7,6 +7,7 @@ from io import BytesIO, StringIO, TextIOWrapper
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud import storage
 import paramiko
@@ -26,7 +27,13 @@ SFTP_USER = os.getenv("SFTP_USER", "").strip()
 SFTP_REMOTE_PATH = os.getenv("SFTP_REMOTE_PATH", "usage_data")
 SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "").strip()
 SFTP_BATCH_TIME_ZONE = os.getenv("SFTP_BATCH_TIME_ZONE", "UTC").strip()
+SFTP_BATCH_ID_OVERRIDE = os.getenv("SFTP_BATCH_ID_OVERRIDE", "").strip()
 ROWS_PER_OUTPUT_FILE = int(os.getenv("ROWS_PER_OUTPUT_FILE", "250000"))
+MIN_ROWS_PER_DAY = int(os.getenv("MIN_ROWS_PER_DAY", "100000"))
+
+if MIN_ROWS_PER_DAY < 0:
+    raise ValueError("MIN_ROWS_PER_DAY cannot be negative")
+
 EXPORT_COLUMNS = [
     "subscription_id",
     "subscription_plan",
@@ -64,10 +71,11 @@ def weekly_window() -> tuple[str, str]:
     return start_date.isoformat(), end_date.isoformat()
 
 
-def build_destination_uri(start_date: str, end_date: str) -> str:
+def build_destination_uri(start_date: str, end_date: str, current_batch_id: str) -> str:
     extension = "csv.gz" if EXPORT_FORMAT == "CSV" else "parquet"
     return (
         f"gs://{BUCKET}/{PREFIX}/week_start={start_date}/week_end={end_date}/"
+        f"batch_id={current_batch_id}/"
         f"tracking_events_chargebee-*.{extension}"
     )
 
@@ -110,10 +118,84 @@ def build_export_sql(destination_uri: str, start_date: str, end_date: str) -> st
     """
 
 
+def validate_export_window(
+    client: bigquery.Client,
+    start_date: str,
+    end_date: str,
+) -> dict[str, int]:
+    event_ts = """
+    CASE
+      WHEN timestamp IS NULL THEN NULL
+      WHEN timestamp >= 1000000000000 THEN TIMESTAMP_MILLIS(timestamp)
+      ELSE TIMESTAMP_SECONDS(timestamp)
+    END
+    """
+    query = f"""
+    WITH expected_dates AS (
+      SELECT event_date
+      FROM UNNEST(
+        GENERATE_DATE_ARRAY(
+          DATE(@start_date),
+          DATE_SUB(DATE(@end_date), INTERVAL 1 DAY)
+        )
+      ) AS event_date
+    ),
+    actual_counts AS (
+      SELECT DATE({event_ts}, 'UTC') AS event_date, COUNT(*) AS row_count
+      FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+      WHERE {event_ts} >= TIMESTAMP(@start_date)
+        AND {event_ts} < TIMESTAMP(@end_date)
+      GROUP BY event_date
+    )
+    SELECT expected_dates.event_date, COALESCE(actual_counts.row_count, 0) AS row_count
+    FROM expected_dates
+    LEFT JOIN actual_counts USING (event_date)
+    ORDER BY event_date
+    """
+    config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "STRING", start_date),
+            bigquery.ScalarQueryParameter("end_date", "STRING", end_date),
+        ]
+    )
+    rows = list(client.query(query, job_config=config).result())
+    rows_by_date = {
+        row["event_date"].isoformat(): row["row_count"]
+        for row in rows
+    }
+    low_volume_days = {
+        event_date: row_count
+        for event_date, row_count in rows_by_date.items()
+        if row_count < MIN_ROWS_PER_DAY
+    }
+    if MIN_ROWS_PER_DAY > 0 and low_volume_days:
+        raise RuntimeError(
+            "Weekly export blocked because one or more days are below "
+            f"MIN_ROWS_PER_DAY={MIN_ROWS_PER_DAY}: {low_volume_days}"
+        )
+    return rows_by_date
+
+
 def list_exported_blobs(bucket_name: str, prefix: str) -> list[storage.Blob]:
     client = storage.Client(project=PROJECT_ID)
     blobs = list(client.list_blobs(bucket_name, prefix=prefix))
     return [blob for blob in blobs if not blob.name.endswith("/")]
+
+
+def download_blob_to_buffer(blob: storage.Blob) -> BytesIO:
+    buffer = BytesIO()
+    try:
+        blob.download_to_file(buffer)
+    except NotFound:
+        # EXPORT DATA can replace a listed object generation while finalizing
+        # shards. Resolve the same object name again without pinning the stale
+        # generation instead of restarting the entire Cloud Run execution.
+        buffer.seek(0)
+        buffer.truncate(0)
+        latest_blob = blob.bucket.blob(blob.name)
+        latest_blob.download_to_file(buffer)
+    buffer.seek(0)
+    return buffer
 
 
 def sftp_enabled() -> bool:
@@ -155,9 +237,7 @@ def upload_exports_to_sftp(destination_uri: str) -> list[str]:
         ensure_remote_dir(sftp, SFTP_REMOTE_PATH)
         for blob in blobs:
             remote_file = f"{SFTP_REMOTE_PATH.rstrip('/')}/{blob.name.rsplit('/', 1)[-1]}"
-            buffer = BytesIO()
-            blob.download_to_file(buffer)
-            buffer.seek(0)
+            buffer = download_blob_to_buffer(blob)
             sftp.putfo(buffer, remote_file)
             uploaded_files.append(remote_file)
     finally:
@@ -168,7 +248,16 @@ def upload_exports_to_sftp(destination_uri: str) -> list[str]:
 
 
 def batch_id() -> str:
-    return datetime.now(ZoneInfo(SFTP_BATCH_TIME_ZONE)).strftime("%Y-%m-%d-%H-%M-%S")
+    value = SFTP_BATCH_ID_OVERRIDE or datetime.now(
+        ZoneInfo(SFTP_BATCH_TIME_ZONE)
+    ).strftime("%Y-%m-%d-%H-%M-%S")
+    try:
+        datetime.strptime(value, "%Y-%m-%d-%H-%M-%S")
+    except ValueError as exc:
+        raise ValueError(
+            "SFTP_BATCH_ID_OVERRIDE must use YYYY-MM-DD-HH-MM-SS"
+        ) from exc
+    return value
 
 
 def iter_export_rows(blobs: list[storage.Blob]):
@@ -176,9 +265,7 @@ def iter_export_rows(blobs: list[storage.Blob]):
         if blob.name.endswith("/"):
             continue
 
-        buffer = BytesIO()
-        blob.download_to_file(buffer)
-        buffer.seek(0)
+        buffer = download_blob_to_buffer(blob)
 
         stream = gzip.GzipFile(fileobj=buffer, mode="rb") if blob.name.endswith(".gz") else buffer
         text_stream = TextIOWrapper(stream, encoding="utf-8", newline="")
@@ -198,13 +285,15 @@ def iter_export_rows(blobs: list[storage.Blob]):
                 stream.close()
 
 
-def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedTemporaryFile], dict]:
+def prepare_batch_files(
+    destination_uri: str,
+    current_batch_id: str,
+) -> tuple[list[tempfile.NamedTemporaryFile], dict]:
     bucket_prefix = destination_uri.removeprefix("gs://")
     bucket_name, blob_pattern = bucket_prefix.split("/", 1)
     blob_prefix = blob_pattern.rsplit("/", 1)[0] + "/"
     blobs = list_exported_blobs(bucket_name, blob_prefix)
 
-    current_batch_id = batch_id()
     output_files: list[tempfile.NamedTemporaryFile] = []
     expected_file_names: list[str] = []
     row_counts: dict[str, int] = {}
@@ -266,17 +355,20 @@ def prepare_batch_files(destination_uri: str) -> tuple[str, list[tempfile.NamedT
         "min_event_timestamp": min_event_timestamp,
         "max_event_timestamp": max_event_timestamp,
     }
-    return current_batch_id, output_files, metadata
+    return output_files, metadata
 
 
-def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
+def upload_batch_to_sftp(
+    destination_uri: str,
+    current_batch_id: str,
+) -> tuple[list[str], dict]:
     if not sftp_enabled():
         raise RuntimeError(
             "SFTP upload is not configured. Set SFTP_HOST, SFTP_USER, and "
             "SFTP_PRIVATE_KEY."
         )
 
-    current_batch_id, part_files, metadata = prepare_batch_files(destination_uri)
+    part_files, metadata = prepare_batch_files(destination_uri, current_batch_id)
     remote_batch_path = f"{SFTP_REMOTE_PATH.rstrip('/')}/{current_batch_id}"
     uploaded_files: list[str] = []
     sftp, transport = sftp_client()
@@ -308,15 +400,19 @@ def upload_batch_to_sftp(destination_uri: str) -> tuple[list[str], dict]:
 
 def main() -> None:
     start_date, end_date = weekly_window()
-    destination_uri = build_destination_uri(start_date, end_date)
+    current_batch_id = batch_id()
+    destination_uri = build_destination_uri(start_date, end_date, current_batch_id)
     sql = build_export_sql(destination_uri, start_date, end_date)
     export_start_ts = f"{start_date} 00:00:00+00"
     export_end_ts = f"{end_date} 00:00:00+00"
 
     client = bigquery.Client(project=PROJECT_ID)
+    rows_by_date = validate_export_window(client, start_date, end_date)
     job = client.query(sql)
     job.result()
-    uploaded_files, metadata = upload_batch_to_sftp(destination_uri)
+    uploaded_files, metadata = upload_batch_to_sftp(
+        destination_uri, current_batch_id
+    )
 
     print(
         "Export completed",
@@ -330,6 +426,8 @@ def main() -> None:
             "week_end": end_date,
             "export_start_ts": export_start_ts,
             "export_end_ts": export_end_ts,
+            "min_rows_per_day": MIN_ROWS_PER_DAY,
+            "rows_by_date": rows_by_date,
             "sftp_host": SFTP_HOST,
             "sftp_remote_path": SFTP_REMOTE_PATH,
             "uploaded_files": len(uploaded_files),
