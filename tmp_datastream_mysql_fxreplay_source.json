@@ -1,0 +1,32 @@
+{
+  "includeObjects": {
+    "mysqlDatabases": [
+      {
+        "database": "fxreplay_prod",
+        "mysqlTables": [
+          {
+            "table": "emaillead"
+          },
+          {
+            "table": "user"
+          },
+          {
+            "table": "timeanalytic"
+          },
+          {
+            "table": "symbollibrary"
+          },
+          {
+            "table": "position"
+          },
+          {
+            "table": "backtestingsession"
+          },
+          {
+            "table": "order"
+          }
+        ]
+      }
+    ]
+  }
+}

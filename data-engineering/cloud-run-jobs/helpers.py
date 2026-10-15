@@ -19,6 +19,10 @@ class JobDefinition:
     source_dir: Path
     env_vars: dict[str, str]
     handler: callable
+    memory: Optional[str] = None
+    task_timeout: Optional[str] = None
+    task_max_retries: Optional[int] = None
+    require_all_secrets: bool = False
     secret_env_vars: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -48,6 +52,10 @@ class CloudRunApp:
         env_vars: dict[str, str],
         schedule: str | None = None,
         timezone: str | None = None,
+        memory: str | None = None,
+        task_timeout: str | None = None,
+        task_max_retries: int | None = None,
+        require_all_secrets: bool = False,
         secret_env_vars: dict[str, str] | None = None,
     ):
         def decorator(func):
@@ -59,6 +67,10 @@ class CloudRunApp:
                     source_dir=Path(source_dir),
                     env_vars=env_vars,
                     handler=func,
+                    memory=memory,
+                    task_timeout=task_timeout,
+                    task_max_retries=task_max_retries,
+                    require_all_secrets=require_all_secrets,
                     secret_env_vars=secret_env_vars or {},
                 )
             )
@@ -93,11 +105,22 @@ def env_vars_arg(env_vars: dict[str, str]) -> str:
     return ",".join(f"{key}={value}" for key, value in env_vars.items())
 
 
-def secret_env_vars_arg(secret_env_vars: dict[str, str]) -> str:
-    pairs = [
-        f"{env_name}={secret_name}:latest"
+def secret_env_vars_arg(
+    secret_env_vars: dict[str, str], require_all: bool = False
+) -> str:
+    existing_secrets = {
+        env_name: secret_name
         for env_name, secret_name in secret_env_vars.items()
         if secret_exists(secret_name)
+    }
+    if require_all and len(existing_secrets) != len(secret_env_vars):
+        missing = sorted(set(secret_env_vars.values()) - set(existing_secrets.values()))
+        raise RuntimeError(
+            "Missing required Secret Manager secrets: " + ", ".join(missing)
+        )
+    pairs = [
+        f"{env_name}={secret_name}:latest"
+        for env_name, secret_name in existing_secrets.items()
     ]
     return ",".join(pairs)
 
@@ -115,10 +138,21 @@ def deploy_command(job: JobDefinition) -> str:
         f"--image {job.image_uri} "
         f"--region {REGION} "
         f"--project {PROJECT_ID} "
-        f"--set-env-vars {env_vars_arg(job.env_vars)}"
+        f'--set-env-vars "{env_vars_arg(job.env_vars)}"'
     )
 
-    secrets_arg = secret_env_vars_arg(job.secret_env_vars)
+    if job.memory:
+        command += f" --memory {job.memory}"
+
+    if job.task_timeout:
+        command += f" --task-timeout {job.task_timeout}"
+
+    if job.task_max_retries is not None:
+        command += f" --max-retries {job.task_max_retries}"
+
+    secrets_arg = secret_env_vars_arg(
+        job.secret_env_vars, require_all=job.require_all_secrets
+    )
     if secrets_arg:
         command += f" --set-secrets {secrets_arg}"
 

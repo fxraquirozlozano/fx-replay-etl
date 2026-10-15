@@ -1,0 +1,102 @@
+[
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "mysqlIdentifier": {
+          "database": "fxreplay_prod",
+          "table": "emaillead"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "createdAt",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "mysqlIdentifier": {
+          "database": "fxreplay_prod",
+          "table": "timeanalytic"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "createdAt",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "mysqlIdentifier": {
+          "database": "fxreplay_prod",
+          "table": "position"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "createdAt",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "mysqlIdentifier": {
+          "database": "fxreplay_prod",
+          "table": "backtestingsession"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "createdAt",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "objectFilter": {
+      "sourceObjectIdentifier": {
+        "mysqlIdentifier": {
+          "database": "fxreplay_prod",
+          "table": "order"
+        }
+      }
+    },
+    "customizationRules": [
+      {
+        "bigqueryPartitioning": {
+          "timeUnitPartition": {
+            "column": "createdAt",
+            "partitioningTimeGranularity": "PARTITIONING_TIME_GRANULARITY_MONTH"
+          }
+        }
+      }
+    ]
+  }
+]

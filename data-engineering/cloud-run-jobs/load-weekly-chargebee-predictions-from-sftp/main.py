@@ -1,9 +1,10 @@
 import csv
 import json
 import os
+import re
 import stat
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from fnmatch import fnmatch
 from io import StringIO
@@ -27,8 +28,13 @@ SFTP_PRIVATE_KEY = os.getenv("SFTP_PRIVATE_KEY", "").strip()
 SFTP_ROOT_PATH = os.getenv("SFTP_ROOT_PATH", "/predictions").strip() or "/predictions"
 SFTP_BATCH_PATH = os.getenv("SFTP_BATCH_PATH", "").strip()
 SFTP_FILE_GLOB = os.getenv("SFTP_FILE_GLOB", "predictions_part_*.csv")
+MAX_BATCH_AGE_DAYS = int(os.getenv("MAX_BATCH_AGE_DAYS", "14"))
 WRITE_DISPOSITION = os.getenv("WRITE_DISPOSITION", "WRITE_APPEND").upper()
 REQUIRED_CONTROL_FILES = ("metadata.json", "schema.csv")
+BATCH_ID_PATTERN = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})-"
+    r"(?P<hour>\d{1,2})-(?P<minute>\d{2})-(?P<second>\d{2})$"
+)
 SCHEMA_TYPE_MAP = {
     "STRING": "STRING",
     "TEXT": "STRING",
@@ -77,15 +83,64 @@ def normalize_remote_dir(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
-def latest_batch_path(sftp: paramiko.SFTPClient) -> str:
+def parse_batch_timestamp(batch_id: str) -> datetime:
+    match = BATCH_ID_PATTERN.fullmatch(batch_id)
+    if not match:
+        raise ValueError(
+            f"Invalid batch directory name {batch_id!r}; expected YYYY-MM-DD-HH-MM-SS"
+        )
+    return datetime(
+        *(int(match.group(field)) for field in (
+            "year", "month", "day", "hour", "minute", "second"
+        )),
+        tzinfo=UTC,
+    )
+
+
+def latest_batch_path(
+    sftp: paramiko.SFTPClient,
+    now: datetime | None = None,
+) -> str:
     root_path = normalize_remote_dir(SFTP_ROOT_PATH)
     entries = sftp.listdir_attr(root_path)
     dirs = [entry for entry in entries if stat.S_ISDIR(entry.st_mode)]
     if not dirs:
         raise FileNotFoundError(f"No batch directories found in {root_path}")
 
-    latest_dir = max(dirs, key=lambda entry: (entry.st_mtime, entry.filename))
-    return f"{root_path}/{latest_dir.filename}"
+    dated_dirs = []
+    invalid_names = []
+    for entry in dirs:
+        try:
+            dated_dirs.append((parse_batch_timestamp(entry.filename), entry.filename))
+        except ValueError:
+            invalid_names.append(entry.filename)
+
+    if not dated_dirs:
+        raise FileNotFoundError(
+            f"No timestamped batch directories found in {root_path}"
+        )
+
+    batch_timestamp, batch_id = max(dated_dirs)
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+    max_age = timedelta(days=MAX_BATCH_AGE_DAYS)
+    if batch_timestamp < current_time - max_age:
+        raise RuntimeError(
+            f"Latest SFTP batch {batch_id} is older than {MAX_BATCH_AGE_DAYS} days"
+        )
+    if batch_timestamp > current_time + timedelta(days=1):
+        raise RuntimeError(f"Latest SFTP batch {batch_id} is unexpectedly in the future")
+
+    print(
+        "Selected latest SFTP batch",
+        {
+            "batch_id": batch_id,
+            "batch_timestamp": batch_timestamp.isoformat(),
+            "ignored_directories": sorted(invalid_names),
+        },
+    )
+    return f"{root_path}/{batch_id}"
 
 
 def list_batch_files(sftp: paramiko.SFTPClient, batch_path: str) -> list[str]:
@@ -243,11 +298,12 @@ def normalize_csv_for_bigquery(
     destination_path: Path,
     schema: list[bigquery.SchemaField],
     batch_id: str,
-) -> None:
+) -> int:
     schema_by_name = {field.name: field for field in schema}
     output_fieldnames = ["batch_id", "source_file_name", "loaded_at", *[field.name for field in schema]]
     loaded_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
+    row_count = 0
     with source_path.open("r", encoding="utf-8-sig", newline="") as source_handle:
         reader = csv.DictReader(source_handle)
         if not reader.fieldnames:
@@ -268,6 +324,9 @@ def normalize_csv_for_bigquery(
                     value = row.get(column_name, "")
                     normalized_row[column_name] = normalize_value(value, field) if field else value
                 writer.writerow(normalized_row)
+                row_count += 1
+
+    return row_count
 
 
 def sanitize_identifier(value: str) -> str:
@@ -307,7 +366,7 @@ def load_into_table(
     table_ref: str,
     schema: list[bigquery.SchemaField],
     write_disposition: str,
-) -> None:
+) -> int:
     for index, csv_path in enumerate(csv_paths):
         effective_write_disposition = write_disposition if index == 0 else "WRITE_APPEND"
         job_config = bigquery.LoadJobConfig(
@@ -318,6 +377,7 @@ def load_into_table(
         )
         with csv_path.open("rb") as handle:
             client.load_table_from_file(handle, table_ref, job_config=job_config).result()
+    return client.get_table(table_ref).num_rows
 
 
 def merge_raw_table(
@@ -325,7 +385,7 @@ def merge_raw_table(
     temp_table_ref: str,
     raw_table_ref: str,
     schema: list[bigquery.SchemaField],
-) -> None:
+) -> int:
     column_names = ["batch_id", "source_file_name", "loaded_at", *[field.name for field in schema]]
     insert_columns = ", ".join(column_names)
     insert_values = ", ".join(f"src.{column}" for column in column_names)
@@ -338,7 +398,9 @@ def merge_raw_table(
       INSERT ({insert_columns})
       VALUES ({insert_values})
     """
-    client.query(sql).result()
+    job = client.query(sql)
+    job.result()
+    return job.num_dml_affected_rows or 0
 
 
 def merge_final_table(
@@ -346,7 +408,7 @@ def merge_final_table(
     temp_table_ref: str,
     final_table_ref: str,
     schema: list[bigquery.SchemaField],
-) -> None:
+) -> int:
     column_names = [field.name for field in schema]
     insert_columns = ", ".join(column_names)
     insert_values = ", ".join(f"src.{column}" for column in column_names)
@@ -358,10 +420,17 @@ def merge_final_table(
       INSERT ({insert_columns}, _ingested_at)
       VALUES ({insert_values}, src.loaded_at)
     """
-    client.query(sql).result()
+    job = client.query(sql)
+    job.result()
+    return job.num_dml_affected_rows or 0
 
 
-def load_predictions(batch_id: str, csv_paths: list[Path], schema: list[bigquery.SchemaField]) -> None:
+def load_predictions(
+    batch_id: str,
+    csv_paths: list[Path],
+    schema: list[bigquery.SchemaField],
+    expected_rows: int,
+) -> dict[str, int]:
     client = bigquery.Client(project=PROJECT_ID)
     final_table_ref = f"{PROJECT_ID}.{DATASET}.{TABLE}"
     raw_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{RAW_BQ_TABLE}"
@@ -376,9 +445,25 @@ def load_predictions(batch_id: str, csv_paths: list[Path], schema: list[bigquery
     ensure_table(client, DATASET, TABLE, final_schema)
 
     try:
-        load_into_table(client, csv_paths, temp_table_ref, raw_schema, "WRITE_TRUNCATE")
-        merge_raw_table(client, temp_table_ref, raw_table_ref, schema)
-        merge_final_table(client, temp_table_ref, final_table_ref, schema)
+        staging_rows = load_into_table(
+            client, csv_paths, temp_table_ref, raw_schema, "WRITE_TRUNCATE"
+        )
+        if staging_rows != expected_rows:
+            raise RuntimeError(
+                f"Staging row count mismatch: files={expected_rows}, staging={staging_rows}"
+            )
+        raw_inserted_rows = merge_raw_table(
+            client, temp_table_ref, raw_table_ref, schema
+        )
+        final_inserted_rows = merge_final_table(
+            client, temp_table_ref, final_table_ref, schema
+        )
+        return {
+            "file_rows": expected_rows,
+            "staging_rows": staging_rows,
+            "raw_inserted_rows": raw_inserted_rows,
+            "final_inserted_rows": final_inserted_rows,
+        }
     finally:
         client.delete_table(temp_table_ref, not_found_ok=True)
 
@@ -386,6 +471,46 @@ def load_predictions(batch_id: str, csv_paths: list[Path], schema: list[bigquery
 def read_metadata(metadata_path: Path) -> dict:
     with metadata_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def validate_metadata(
+    metadata: dict,
+    batch_id: str,
+    csv_filenames: list[str],
+    file_row_counts: dict[str, int],
+) -> None:
+    declared_batch_id = metadata.get("batch_id")
+    if declared_batch_id and declared_batch_id != batch_id:
+        raise RuntimeError(
+            f"Metadata batch_id mismatch: directory={batch_id}, "
+            f"metadata={declared_batch_id}"
+        )
+
+    expected_file_count = metadata.get("expected_file_count")
+    if expected_file_count is not None and int(expected_file_count) != len(csv_filenames):
+        raise RuntimeError(
+            f"Metadata file count mismatch: expected={expected_file_count}, "
+            f"actual={len(csv_filenames)}"
+        )
+
+    expected_file_names = metadata.get("expected_file_names")
+    if expected_file_names is not None and sorted(expected_file_names) != sorted(csv_filenames):
+        raise RuntimeError(
+            f"Metadata file names mismatch: expected={sorted(expected_file_names)}, "
+            f"actual={sorted(csv_filenames)}"
+        )
+
+    expected_row_counts = metadata.get("row_counts")
+    if expected_row_counts is not None:
+        normalized_expected_counts = {
+            filename: int(row_count)
+            for filename, row_count in expected_row_counts.items()
+        }
+        if normalized_expected_counts != file_row_counts:
+            raise RuntimeError(
+                f"Metadata row count mismatch: expected={normalized_expected_counts}, "
+                f"actual={file_row_counts}"
+            )
 
 
 def main() -> None:
@@ -403,9 +528,10 @@ def main() -> None:
             csv_filenames = sorted(name for name in filenames if fnmatch(name, SFTP_FILE_GLOB))
             metadata = read_metadata(local_files["metadata.json"])
             normalized_csv_paths: list[Path] = []
+            file_row_counts: dict[str, int] = {}
             for csv_filename in csv_filenames:
                 normalized_path = Path(tmp_dir) / f"normalized-{csv_filename}"
-                normalize_csv_for_bigquery(
+                file_row_counts[csv_filename] = normalize_csv_for_bigquery(
                     local_files[csv_filename],
                     normalized_path,
                     schema,
@@ -413,7 +539,13 @@ def main() -> None:
                 )
                 normalized_csv_paths.append(normalized_path)
 
-            load_predictions(batch_id, normalized_csv_paths, schema)
+            file_rows = sum(file_row_counts.values())
+            if file_rows == 0:
+                raise RuntimeError(f"Predictions batch {batch_id} contains no data rows")
+            validate_metadata(metadata, batch_id, csv_filenames, file_row_counts)
+            load_stats = load_predictions(
+                batch_id, normalized_csv_paths, schema, file_rows
+            )
 
         print(
             "Predictions batch loaded",
@@ -428,6 +560,7 @@ def main() -> None:
                 "csv_files": csv_filenames,
                 "metadata_keys": sorted(metadata.keys()),
                 "write_disposition": WRITE_DISPOSITION,
+                **load_stats,
             },
         )
     finally:
