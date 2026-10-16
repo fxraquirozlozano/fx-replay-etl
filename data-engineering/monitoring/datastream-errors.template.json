@@ -1,0 +1,33 @@
+{
+  "displayName": "Data Alerts - Datastream CDC error",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/fxr-analytics/notificationChannels/REPLACE_WITH_DATA_ALERTS_CHANNEL_ID"
+  ],
+  "userLabels": {
+    "service": "data-pipelines",
+    "managed_by": "fx-replay-etl"
+  },
+  "conditions": [
+    {
+      "displayName": "Error in an active CDC stream",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"datastream.googleapis.com/Stream\"\nresource.labels.project_id=\"fxr-analytics\"\nresource.labels.location=\"us-central1\"\nlog_id(\"datastream.googleapis.com/stream_activity\")\nseverity>=ERROR\n(resource.labels.stream_id=\"fxreplay-prod-bigquery-datastream\" OR resource.labels.stream_id=\"fxreplay-prod-mysql-bigquery-gtid-20261015\" OR resource.labels.stream_id=\"tracking-prod-event-append-validation\")",
+        "labelExtractors": {
+          "stream_id": "EXTRACT(resource.labels.stream_id)"
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    },
+    "autoClose": "3600s"
+  },
+  "documentation": {
+    "mimeType": "text/markdown",
+    "content": "Datastream emitted an ERROR for CDC stream ${log.extracted_label.stream_id}. Review its current state, replication errors and source connectivity.\n\nhttps://console.cloud.google.com/datastream/streams?project=fxr-analytics\n\nThis policy detects new error log entries. It does not detect a silently stalled stream, missing logs or replication lag. Automatic incident closure is not proof of recovery."
+  }
+}
