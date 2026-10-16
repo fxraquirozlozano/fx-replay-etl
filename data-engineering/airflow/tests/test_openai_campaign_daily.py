@@ -276,4 +276,3 @@ def test_openai_partial_extraction_failure_never_loads_bigquery():
         else:
             raise AssertionError("Partial extraction must fail")
         load.assert_not_called()
-
