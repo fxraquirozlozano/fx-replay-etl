@@ -97,14 +97,22 @@ def ensure_account(name):
 
 
 def policy_documents(channel):
-    policies = []
-    for path in sorted(HERE.glob("*.template.json")):
-        policy = json.loads(path.read_text(encoding="utf-8"))
-        policy["notificationChannels"] = [channel]
-        policies.append(policy)
-    if len(policies) != 2:
-        raise RuntimeError("Expected the Cloud Run and Datastream alert templates")
-    return policies
+    path = HERE / "datastream-errors.template.json"
+    policy = json.loads(path.read_text(encoding="utf-8"))
+    policy["notificationChannels"] = [channel]
+    return [policy]
+
+
+def disable_legacy_job_alert(policies):
+    # Retire only the extra job policy installed by this integration.
+    for policy in policies:
+        if (policy.get("name") == f"projects/{PROJECT}/alertPolicies/11189439487452597550"
+                and policy.get("displayName") == "Data Alerts - Cloud Run job execution failed"
+                and policy.get("userLabels", {}).get("managed_by") == "fx-replay-etl"
+                and policy.get("enabled")):
+            google_api("PATCH", policy["name"] + "?updateMask=enabled",
+                       {"name": policy["name"], "enabled": False})
+            print("Disabled the legacy extra Cloud Run job alert")
 
 
 def deploy(group_id, send_test):
@@ -191,6 +199,7 @@ def deploy(group_id, send_test):
         else:
             raise RuntimeError("Test delivery was not confirmed; policies have not been activated")
     existing_policies = list_monitoring("alertPolicies")
+    disable_legacy_job_alert(existing_policies)
     for policy in policy_documents(channel["name"]):
         matches = [p for p in existing_policies if p.get("displayName") == policy["displayName"]]
         if len(matches) > 1:
