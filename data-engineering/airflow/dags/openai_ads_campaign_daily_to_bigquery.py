@@ -162,7 +162,7 @@ def sync_openai_campaign_daily() -> dict[str, Any]:
 
 with DAG(
     dag_id="openai_ads_campaign_daily_to_bigquery",
-    description="Read-only daily ChatGPT Ads campaign performance export.",
+    description="Read-only daily ChatGPT Ads performance export, preserving signed spend.",
     start_date=datetime(2026, 1, 1, tzinfo=UTC),
     schedule="30 8 * * *", catchup=False, is_paused_upon_creation=True,
     max_active_runs=1,
