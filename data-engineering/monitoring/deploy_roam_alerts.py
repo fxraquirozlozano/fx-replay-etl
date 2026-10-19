@@ -102,8 +102,8 @@ def policy_documents(channel):
         policy = json.loads(path.read_text(encoding="utf-8"))
         policy["notificationChannels"] = [channel]
         policies.append(policy)
-    if len(policies) != 2:
-        raise RuntimeError("Expected the Cloud Run and Datastream alert templates")
+    if len(policies) != 3:
+        raise RuntimeError("Expected the Cloud Run, Datastream error and Datastream lag alert templates")
     return policies
 
 
