@@ -7,6 +7,23 @@ import deploy_roam_alerts as deploy
 GROUP_ID = "2c98090b-d3e0-406f-a2ef-211fbd3539ce"
 
 
+class PolicyTests(unittest.TestCase):
+    def test_all_policy_templates_use_the_selected_channel(self):
+        channel = "projects/test-project/notificationChannels/test-channel"
+        policies = deploy.policy_documents(channel)
+        self.assertEqual(len(policies), 3)
+        self.assertEqual(len({p["displayName"] for p in policies}), 3)
+        for policy in policies:
+            self.assertEqual(policy["notificationChannels"], [channel])
+            self.assertTrue(policy["enabled"])
+        lag = next(p for p in policies if "lag over" in p["displayName"])
+        condition = lag["conditions"][0]["conditionThreshold"]
+        self.assertEqual(condition["thresholdValue"], 3600)
+        self.assertEqual(condition["duration"], "600s")
+        self.assertIn("fxreplay-prod-mysql-bigquery-gtid-20261019", condition["filter"])
+        self.assertNotIn("fxreplay-prod-mysql-bigquery-gtid-20261015", condition["filter"])
+
+
 class DestinationTests(unittest.TestCase):
     @patch.object(deploy.requests, "get")
     def test_group_id_is_verified_against_name(self, get):

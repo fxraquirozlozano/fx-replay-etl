@@ -13,7 +13,7 @@
     {
       "displayName": "Error in an active CDC stream",
       "conditionMatchedLog": {
-        "filter": "resource.type=\"datastream.googleapis.com/Stream\"\nlogName=\"projects/fxr-analytics/logs/datastream.googleapis.com%2Fstream_activity\"\nresource.labels.location=\"us-central1\"\nlog_id(\"datastream.googleapis.com/stream_activity\")\nseverity>=ERROR\n(resource.labels.stream_id=\"fxreplay-prod-bigquery-datastream\" OR resource.labels.stream_id=\"fxreplay-prod-mysql-bigquery-gtid-20261015\" OR resource.labels.stream_id=\"tracking-prod-event-append-validation\")",
+        "filter": "resource.type=\"datastream.googleapis.com/Stream\"\nlogName=\"projects/fxr-analytics/logs/datastream.googleapis.com%2Fstream_activity\"\nresource.labels.location=\"us-central1\"\nlog_id(\"datastream.googleapis.com/stream_activity\")\nseverity>=ERROR\n(resource.labels.stream_id=\"fxreplay-prod-bigquery-datastream\" OR resource.labels.stream_id=\"fxreplay-prod-mysql-bigquery-gtid-20261019\" OR resource.labels.stream_id=\"tracking-prod-event-append-validation\")",
         "labelExtractors": {
           "stream_id": "EXTRACT(resource.labels.stream_id)"
         }

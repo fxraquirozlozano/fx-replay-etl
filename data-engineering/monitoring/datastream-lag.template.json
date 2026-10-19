@@ -1,0 +1,40 @@
+{
+  "displayName": "Data Alerts - Datastream CDC lag over 1 hour",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/fxr-analytics/notificationChannels/REPLACE_WITH_DATA_ALERTS_CHANNEL_ID"
+  ],
+  "userLabels": {
+    "service": "data-pipelines",
+    "managed_by": "fx-replay-etl"
+  },
+  "conditions": [
+    {
+      "displayName": "Source-to-read lag exceeds 1 hour for 10 minutes",
+      "conditionThreshold": {
+        "filter": "resource.type=\"datastream.googleapis.com/Stream\" AND resource.labels.project_id=\"fxr-analytics\" AND resource.labels.location=\"us-central1\" AND metric.type=\"datastream.googleapis.com/stream/freshness\" AND resource.labels.stream_id=one_of(\"fxreplay-prod-bigquery-datastream\", \"fxreplay-prod-mysql-bigquery-gtid-20261019\", \"tracking-prod-event-append-validation\")",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 3600,
+        "duration": "600s",
+        "trigger": {
+          "count": 1
+        },
+        "evaluationMissingData": "EVALUATION_MISSING_DATA_INACTIVE"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "86400s"
+  },
+  "documentation": {
+    "mimeType": "text/markdown",
+    "content": "CDC source-to-read lag has exceeded 1 hour for 10 minutes for ${resource.label.stream_id}. Investigate source replication lag, stream throughput and connectivity before required source logs expire.\n\nThis measures source-to-read delay, not the BigQuery dataFreshness setting. It can fire during backfill. Missing metrics are not proof of recovery; this policy does not detect an inactive stream with no metrics.\n\nhttps://console.cloud.google.com/datastream/streams?project=fxr-analytics"
+  }
+}

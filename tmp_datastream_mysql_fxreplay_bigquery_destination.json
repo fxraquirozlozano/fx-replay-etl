@@ -3,5 +3,5 @@
     "datasetId": "fxr-analytics:fxreplay_prod"
   },
   "merge": {},
-  "dataFreshness": "300s"
+  "dataFreshness": "3600s"
 }
