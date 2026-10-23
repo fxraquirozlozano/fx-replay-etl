@@ -1,131 +1,171 @@
+"""
+appcues_to_bigquery_backfill.py
+
+Manual DAG to backfill `appcues.responses` over a historical window.
+
+Reuses the same building blocks as the daily DAG (`appcues_to_bigquery.py`)
+through `appcues_lib.py`, so rows written here are byte-identical to what the
+daily DAG produces for the same window.
+
+Trigger from the Airflow UI with a config JSON like:
+    {"start_date": "2024-01-01", "end_date": "2026-07-31"}
+
+If `end_date` is omitted it defaults to yesterday. `start_date` is required.
+
+Layout
+------
+Each calendar month is a separate task instance via dynamic task mapping.
+One failing month can be retried without redoing the others. Chunks run
+sequentially (max_active_tis_per_dag=1) so we do not overload the Appcues
+export endpoint. A final cleanup task drops the staging table regardless
+of whether any chunk failed.
+"""
+
 from __future__ import annotations
 
-import os
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
 
 from airflow import DAG
 try:
-    from airflow.sdk import get_current_context, task
+    from airflow.sdk import task
 except ImportError:
     from airflow.decorators import task
-    try:
-        from airflow.operators.python import get_current_context
-    except ImportError:
-        from airflow.decorators import get_current_context
-from google.cloud import bigquery
+from airflow.models.param import Param
+from airflow.utils.trigger_rule import TriggerRule
 
+from appcues_lib import (
+    DEFAULT_STAGING_TABLE,
+    drop_table,
+    get_bq_client,
+    month_chunks,
+    run_chunk,
+)
 from appcues_to_bigquery import (
     BQ_TABLE,
     FINAL_BQ_DATASET,
     PROJECT_ID,
     RAW_BQ_DATASET,
-    airflow_var,
-    download_export,
-    extract_rows_from_export,
-    get_bq_client,
-    load_rows,
-    merge_raw_into_history,
-    resolve_download_url,
-    submit_export_job,
-    wait_for_export_job,
+    _build_config,
 )
 
 
-BACKFILL_BQ_TABLE = airflow_var("APPCUES_BACKFILL_BQ_TABLE", "nps_events_backfill")
-
-
-def parse_date(value: str) -> date:
+def _parse_date(value: str | None) -> date | None:
+    if value in (None, ""):
+        return None
     return datetime.fromisoformat(value).date()
 
 
-def iter_days(start_date: date, end_date: date):
-    current = start_date
-    while current <= end_date:
-        yield current
-        current += timedelta(days=1)
+@task
+def plan_chunks(**context) -> list[dict[str, str]]:
+    """
+    Validates params and expands the requested window into monthly chunks.
+    Returns a list of dicts because dynamic task mapping requires JSON-safe
+    values.
+    """
+    params = context["params"]
 
+    start = _parse_date(params.get("start_date"))
+    if start is None:
+        raise ValueError("start_date is required (YYYY-MM-DD).")
 
-def resolve_backfill_window() -> tuple[date, date]:
-    context = get_current_context()
-    ds = datetime.fromisoformat(context["ds"]).date()
-    conf = (context.get("dag_run") and context["dag_run"].conf) or {}
+    end = _parse_date(params.get("end_date")) or (date.today() - timedelta(days=1))
+    if start > end:
+        raise ValueError(f"start_date ({start}) must be <= end_date ({end}).")
 
-    start_date = parse_date(conf["start_date"]) if conf.get("start_date") else ds
-    end_date = parse_date(conf["end_date"]) if conf.get("end_date") else start_date
-    if start_date > end_date:
-        raise ValueError("start_date must be before or equal to end_date.")
-
-    return start_date, end_date
-
-
-def process_backfill_day(
-    client: bigquery.Client,
-    process_date: date,
-    raw_table_ref: str,
-    final_table_ref: str,
-) -> dict[str, Any]:
-    job_url = submit_export_job(process_date, process_date)
-    job_payload = wait_for_export_job(job_url)
-    download_url = resolve_download_url(job_payload)
-    export_file_path = download_export(download_url)
-
-    try:
-        rows = extract_rows_from_export(
-            export_file_path,
-            process_date,
-            process_date,
-            process_date,
-        )
-    finally:
-        if os.path.exists(export_file_path):
-            os.remove(export_file_path)
-
-    load_rows(
-        client,
-        raw_table_ref,
-        rows,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
-    if rows:
-        merge_raw_into_history(client, raw_table_ref, final_table_ref)
-
-    return {"date": process_date.isoformat(), "rows": len(rows)}
-
-
-def run_appcues_daily_backfill() -> dict[str, Any]:
-    client = get_bq_client()
-    start_date, end_date = resolve_backfill_window()
-    raw_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{BACKFILL_BQ_TABLE}"
-    final_table_ref = f"{PROJECT_ID}.{FINAL_BQ_DATASET}.{BQ_TABLE}"
-    results = [
-        process_backfill_day(client, process_date, raw_table_ref, final_table_ref)
-        for process_date in iter_days(start_date, end_date)
+    chunks = [
+        {"start": s.isoformat(), "end": e.isoformat()}
+        for s, e in month_chunks(start, end)
     ]
+    print(f"Planned {len(chunks)} monthly chunks for {start} .. {end}")
+    for i, c in enumerate(chunks, 1):
+        print(f"  [{i:>3}/{len(chunks)}] {c['start']} .. {c['end']}")
+    return chunks
 
-    return {
-        "raw_table": raw_table_ref,
-        "final_table": final_table_ref,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "days": len(results),
-        "rows": sum(int(result["rows"]) for result in results),
-        "results": results,
-    }
+
+@task(
+    max_active_tis_per_dag=1,  # sequential chunks within a DAG run
+    retries=2,
+    retry_delay=timedelta(minutes=10),
+)
+def run_chunk_task(chunk: dict[str, str]) -> int:
+    """Executes a single monthly chunk: export -> download -> load -> merge."""
+    config = _build_config()
+    client = get_bq_client(PROJECT_ID)
+
+    staging_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{DEFAULT_STAGING_TABLE}"
+    final_table_ref = f"{PROJECT_ID}.{FINAL_BQ_DATASET}.{BQ_TABLE}"
+
+    chunk_start = date.fromisoformat(chunk["start"])
+    chunk_end = date.fromisoformat(chunk["end"])
+
+    return run_chunk(
+        config,
+        client,
+        chunk_start,
+        chunk_end,
+        staging_table_ref,
+        final_table_ref,
+    )
+
+
+@task(trigger_rule=TriggerRule.ALL_DONE)
+def cleanup_staging(**context) -> None:
+    """
+    Drops the staging table. Runs even if some chunks failed so the raw
+    dataset does not accumulate orphan tables. Skipped if the trigger
+    config sets keep_staging=true.
+    """
+    params = context["params"]
+    if params.get("keep_staging"):
+        print("keep_staging=true, leaving staging table in place.")
+        return
+
+    client = get_bq_client(PROJECT_ID)
+    staging_table_ref = f"{PROJECT_ID}.{RAW_BQ_DATASET}.{DEFAULT_STAGING_TABLE}"
+    print(f"Dropping staging table {staging_table_ref}")
+    drop_table(client, staging_table_ref)
 
 
 with DAG(
     dag_id="appcues_to_bigquery_backfill",
-    description="Backfill diario bajo demanda de eventos NPS desde Appcues hacia BigQuery.",
+    description=(
+        "Manual backfill of appcues.responses. Trigger with "
+        '{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}. '
+        "One task instance per calendar month."
+    ),
+    schedule=None,  # manual trigger only
     start_date=datetime(2024, 1, 1, tzinfo=UTC),
-    schedule=None,
     catchup=False,
     max_active_runs=1,
+    is_paused_upon_creation=True,
+    params={
+        "start_date": Param(
+            None,
+            type=["string", "null"],
+            format="date",
+            title="Start date",
+            description="Window start (inclusive), YYYY-MM-DD. Required.",
+        ),
+        "end_date": Param(
+            None,
+            type=["string", "null"],
+            format="date",
+            title="End date",
+            description="Window end (inclusive), YYYY-MM-DD. Defaults to yesterday.",
+        ),
+        "keep_staging": Param(
+            False,
+            type="boolean",
+            title="Keep staging table",
+            description="Do not drop the staging table when the run finishes.",
+        ),
+    },
     default_args={
         "owner": "data-engineering",
         "depends_on_past": False,
-        "retries": 0,
     },
-    tags=["appcues", "nps", "bigquery", "backfill"],
+    tags=["appcues", "surveys", "backfill", "bigquery"],
 ) as dag:
-    task(task_id="run_appcues_daily_backfill")(run_appcues_daily_backfill)()
+    chunks = plan_chunks()
+    chunk_results = run_chunk_task.expand(chunk=chunks)
+    chunk_results >> cleanup_staging()
