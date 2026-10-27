@@ -9,8 +9,8 @@ Diseno:
   - Discovery: GET /forms + filtro por fecha -> upsert en tracked_forms
                (agrega forms nuevos, nunca los saca).
   - Lista a procesar: SELECT de typeform_raw.tracked_forms (is_active = TRUE).
-  - Incrementalidad: watermark por form = MAX(submitted_at) en la tabla final,
-                     se pasa como `since` a la Responses API.
+  - Relectura diaria: historico completo de respuestas completas y parciales,
+                     incluyendo tags/variables modificados despues del envio.
   - Carga: NDJSON -> GCS -> raw efimera (WRITE_TRUNCATE) -> MERGE a la final
            dedup por response_id (mismo patron que los demas DAGs).
 
@@ -18,15 +18,16 @@ Tablas (en fxr-analytics.typeform_raw):
   - responses          (final, append/merge)
   - responses_raw      (buffer efimero por corrida)
   - form_definitions   (snapshot de fields, append)
+  - form_metadata_snapshots (variables y logica, snapshot cuando cambian)
   - tracked_forms      (estado: que forms procesar)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-import re
 import tempfile
 import time
 from datetime import UTC, datetime, timedelta
@@ -62,6 +63,7 @@ DATASET = airflow_var("TYPEFORM_BQ_DATASET", "typeform_raw")
 RESPONSES_TABLE = airflow_var("TYPEFORM_RESPONSES_TABLE", "responses")
 RESPONSES_RAW_TABLE = airflow_var("TYPEFORM_RESPONSES_RAW_TABLE", "responses_raw")
 DEFINITIONS_TABLE = airflow_var("TYPEFORM_DEFINITIONS_TABLE", "form_definitions")
+METADATA_TABLE = airflow_var("TYPEFORM_METADATA_TABLE", "form_metadata_snapshots")
 TRACKED_FORMS_TABLE = airflow_var("TYPEFORM_TRACKED_FORMS_TABLE", "tracked_forms")
 
 # Token de Typeform en Secret Manager
@@ -129,10 +131,20 @@ def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+class TypeformHTTPError(RuntimeError):
+    """Error HTTP identificable sin incluir payloads de respuestas en los logs."""
+
+    def __init__(self, status_code: int, url: str):
+        self.status_code = status_code
+        super().__init__(f"HTTP {status_code} en {url}")
+
+
 def get_with_retry(url: str, token: str, params: dict | None = None) -> dict:
     headers = _auth_headers(token)
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
+        # Aplicar el limite tambien entre forms y endpoints, no solo entre paginas.
+        time.sleep(RATE_LIMIT_SLEEP)
         try:
             resp = requests.get(
                 url, headers=headers, params=params or {},
@@ -148,7 +160,7 @@ def get_with_retry(url: str, token: str, params: dict | None = None) -> dict:
             logger.warning("Typeform %s en %s, reintentando", resp.status_code, url)
             time.sleep((attempt + 1) * 2)
             continue
-        raise RuntimeError(f"HTTP {resp.status_code} en {url}: {resp.text}")
+        raise TypeformHTTPError(resp.status_code, url)
     raise RuntimeError(f"Reintentos agotados para {url}: {last_error}")
 
 
@@ -168,7 +180,6 @@ def fetch_all_forms(token: str) -> list[dict[str, Any]]:
         if len(items) < FORMS_PAGE_SIZE:
             break
         page += 1
-        time.sleep(RATE_LIMIT_SLEEP)
     return all_forms
 
 
@@ -206,7 +217,6 @@ def fetch_responses_since(
         before = items[-1].get("token")
         if not before or len(items) < PAGE_SIZE:
             break
-        time.sleep(RATE_LIMIT_SLEEP)
 
     return all_items
 
@@ -218,18 +228,18 @@ def fetch_form_responses(
 ) -> list[dict[str, Any]]:
     """Trae respuestas de un form combinando dos pulls:
 
-      - COMPLETED: incremental con `since = completed_since` (watermark). Eficiente:
-        en cada corrida solo trae las completadas nuevas.
+      - COMPLETED: historico completo cuando completed_since=None (daily/backfill).
+        El filtro opcional se conserva para consumidores que lo necesiten.
       - PARTIAL: full refresh (since=None) en cada corrida. Las parciales son pocas
         en terminos absolutos y MUTAN (una parcial puede completarse despues, pasando
         a 'completed' con el mismo response_id). Trayendolas enteras siempre, el MERGE
         por response_id captura esa transicion y reemplaza la fila vieja.
 
-    Para el backfill, completed_since=None hace ambos full.
+    Ambos DAGs usan completed_since=None para recuperar cambios historicos.
     """
-    completed = fetch_responses_since(form_id, token, "completed", completed_since)
-    # Parciales: siempre full (since=None), sin importar el watermark de completadas.
+    # Leer completas despues de parciales para capturar transiciones durante el pull.
     partial = fetch_responses_since(form_id, token, "partial", None)
+    completed = fetch_responses_since(form_id, token, "completed", completed_since)
     return completed + partial
 
 
@@ -263,12 +273,15 @@ def discover_active_forms(token: str, since_days: int) -> list[dict[str, Any]]:
 
 
 def upsert_tracked_forms(client: bigquery.Client, discovered: list[dict[str, Any]]) -> int:
-    """Inserta en tracked_forms los forms que aun no esten. Nunca borra/desactiva."""
+    """Inserta forms y actualiza titulos. Preserva first_seen e is_active.
+
+    Devuelve el total de filas insertadas o actualizadas.
+    """
     if not discovered:
         return 0
     tracked_ref = f"{PROJECT_ID}.{DATASET}.{TRACKED_FORMS_TABLE}"
 
-    # MERGE: solo inserta los que no existen (preserva first_seen e is_active).
+    # Los cambios de nombre no deben reactivar forms deshabilitados manualmente.
     rows_json = "\n".join(
         json.dumps({"form_id": d["form_id"], "form_title": d["form_title"]})
         for d in discovered
@@ -291,6 +304,8 @@ def upsert_tracked_forms(client: bigquery.Client, discovered: list[dict[str, Any
     MERGE `{tracked_ref}` T
     USING `{staging_ref}` S
     ON T.form_id = S.form_id
+    WHEN MATCHED AND T.form_title IS DISTINCT FROM S.form_title THEN
+      UPDATE SET form_title = S.form_title
     WHEN NOT MATCHED THEN
       INSERT (form_id, form_title, first_seen, is_active)
       VALUES (S.form_id, S.form_title, CURRENT_TIMESTAMP(), TRUE)
@@ -401,8 +416,127 @@ def build_response_row(item: dict[str, Any], form_id: str, loaded_at: str) -> di
         # y BQ las parsea al cargar (columna tipo JSON).
         "hidden_extra": extra or None,
         "answers": item.get("answers") or [],
+        # El endpoint sin proyecciones omite tags cuando no hay etiquetas.
+        # [] reemplaza tags anteriores; NULL en filas viejas significa no revalidado.
+        "tags": item.get("tags") or [],
+        "variables": item.get("variables") or [],
         "_loaded_at": loaded_at,
     }
+
+
+def build_form_metadata_row(form: dict[str, Any], snapshot_at: str) -> dict[str, Any]:
+    """Configuracion del form, separada de los valores de cada respuesta."""
+    metadata = {
+        "form_title": form.get("title"),
+        "variables": form.get("variables") or {},
+        "logic": form.get("logic") or [],
+    }
+    canonical = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    return {
+        "form_id": form["id"],
+        **metadata,
+        "definition_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "snapshot_at": snapshot_at,
+    }
+
+
+def get_form_metadata_hashes(client: bigquery.Client) -> dict[str, str]:
+    query = f"""
+      SELECT form_id, definition_hash
+      FROM `{PROJECT_ID}.{DATASET}.{METADATA_TABLE}`
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY form_id ORDER BY snapshot_at DESC, definition_hash DESC
+      ) = 1
+    """
+    return {row.form_id: row.definition_hash for row in client.query(query).result()}
+
+
+def ingest_forms_to_raw(
+    client: bigquery.Client,
+    token: str,
+    forms: list[dict[str, Any]],
+    task_prefix: str = "",
+) -> dict[str, Any]:
+    """Carga los forms accesibles. Los 404 se reportan para validar DESPUES del MERGE.
+
+    No publicar respuestas incompletas de un form cuyo pull falla a mitad.
+    Daily y backfill comparten staging: deben ejecutarse sin superposicion.
+    """
+    loaded_at = datetime.now(UTC).isoformat()
+    previous_hashes = get_form_metadata_hashes(client)
+    response_rows: list[dict[str, Any]] = []
+    definition_rows: list[dict[str, Any]] = []
+    metadata_rows: list[dict[str, Any]] = []
+    per_form: list[dict[str, Any]] = []
+    failed_forms: list[dict[str, Any]] = []
+
+    for form in forms:
+        form_id = form["form_id"]
+        try:
+            definition = fetch_form_definition(form_id, token)
+            items = fetch_form_responses(form_id, token, completed_since=None)
+        except TypeformHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning("Form %s inaccesible (404); continuando con los demas", form_id)
+            failed_forms.append({"form_id": form_id, "status_code": 404})
+            continue
+
+        rows = [build_response_row(item, form_id, loaded_at) for item in items]
+        response_rows.extend(rows)
+        definition_rows.extend(build_form_definition_rows(definition, loaded_at))
+        metadata = build_form_metadata_row(definition, loaded_at)
+        if previous_hashes.get(form_id) != metadata["definition_hash"]:
+            metadata_rows.append(metadata)
+            previous_hashes[form_id] = metadata["definition_hash"]
+        per_form.append({
+            "form_id": form_id,
+            "fetched": len(rows),
+            "tagged": sum(bool(row["tags"]) for row in rows),
+            "with_variables": sum(bool(row["variables"]) for row in rows),
+        })
+
+    for rows, table, schema, tag in (
+        (definition_rows, DEFINITIONS_TABLE, DEFINITIONS_SCHEMA, "form_definitions"),
+        (metadata_rows, METADATA_TABLE, METADATA_SCHEMA, "form_metadata_snapshots"),
+    ):
+        uri = stage_rows_to_gcs(rows, f"{task_prefix}{tag}")
+        if uri:
+            load_ndjson_uri(
+                client, f"{PROJECT_ID}.{DATASET}.{table}", schema, uri,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            )
+
+    raw_ref = f"{PROJECT_ID}.{DATASET}.{RESPONSES_RAW_TABLE}"
+    responses_uri = stage_rows_to_gcs(response_rows, f"{task_prefix}responses_raw")
+    if responses_uri:
+        load_ndjson_uri(client, raw_ref, RESPONSES_SCHEMA, responses_uri)
+    else:
+        # Incluye el caso de todos los forms en 404: no reusar staging viejo.
+        client.query(f"TRUNCATE TABLE `{raw_ref}`").result()
+
+    return {
+        "forms_attempted": len(forms),
+        "forms_processed": len(per_form),
+        "definitions_rows": len(definition_rows),
+        "metadata_rows": len(metadata_rows),
+        "response_rows": len(response_rows),
+        "has_responses": bool(responses_uri),
+        "failed_forms": failed_forms,
+        "per_form": per_form,
+    }
+
+
+def validate_ingestion_result(ingest_result: dict[str, Any]) -> None:
+    """Fallar al final sin revertir la carga de los forms disponibles."""
+    failed_forms = ingest_result["failed_forms"]
+    if failed_forms:
+        details = ", ".join(f"{f['form_id']} ({f['status_code']})" for f in failed_forms)
+        raise RuntimeError(
+            f"Carga incompleta: {ingest_result['forms_processed']} formularios procesados; "
+            f"{len(failed_forms)} inaccesibles: {details}. "
+            "Las respuestas de los formularios disponibles ya fueron cargadas."
+        )
 
 
 # ============================================================
@@ -469,6 +603,8 @@ RESPONSES_SCHEMA = [
     bigquery.SchemaField("hidden_extra", "JSON"),
     bigquery.SchemaField("answers", "JSON"),
     bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
+    bigquery.SchemaField("tags", "JSON"),
+    bigquery.SchemaField("variables", "JSON"),
 ]
 
 DEFINITIONS_SCHEMA = [
@@ -483,16 +619,29 @@ DEFINITIONS_SCHEMA = [
 ]
 
 
+METADATA_SCHEMA = [
+    bigquery.SchemaField("form_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("form_title", "STRING"),
+    bigquery.SchemaField("variables", "JSON"),
+    bigquery.SchemaField("logic", "JSON"),
+    bigquery.SchemaField("definition_hash", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("snapshot_at", "TIMESTAMP", mode="REQUIRED"),
+]
+
+
 def merge_responses_raw_into_final(client: bigquery.Client) -> int:
     """MERGE de la raw efimera a la final, dedup por response_id (gana el _loaded_at mas nuevo)."""
     raw_ref = f"{PROJECT_ID}.{DATASET}.{RESPONSES_RAW_TABLE}"
     final_ref = f"{PROJECT_ID}.{DATASET}.{RESPONSES_TABLE}"
+    columns = ", ".join(f"`{field.name}`" for field in RESPONSES_SCHEMA)
+    values = ", ".join(f"S.`{field.name}`" for field in RESPONSES_SCHEMA)
     merge_sql = f"""
     MERGE `{final_ref}` T
     USING (
       SELECT * EXCEPT(rn) FROM (
         SELECT *, ROW_NUMBER() OVER (
-          PARTITION BY response_id ORDER BY _loaded_at DESC
+          PARTITION BY response_id ORDER BY _loaded_at DESC,
+            IF(response_type = 'completed', 1, 0) DESC, submitted_at DESC
         ) AS rn
         FROM `{raw_ref}`
       ) WHERE rn = 1
@@ -511,9 +660,11 @@ def merge_responses_raw_into_final(client: bigquery.Client) -> int:
       hidden_plan_tier = S.hidden_plan_tier,
       hidden_extra = S.hidden_extra,
       answers = S.answers,
+      tags = S.tags,
+      variables = S.variables,
       _loaded_at = S._loaded_at
     WHEN NOT MATCHED THEN
-      INSERT ROW
+      INSERT ({columns}) VALUES ({values})
     """
     job = client.query(merge_sql)
     job.result()
