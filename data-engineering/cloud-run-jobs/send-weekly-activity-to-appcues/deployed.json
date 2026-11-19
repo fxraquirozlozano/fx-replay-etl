@@ -1,0 +1,165 @@
+{
+  "retrieved_on": "2026-11-17",
+  "project": "fxr-analytics",
+  "region": "us-central1",
+  "job": "send-weekly-activity-to-appcues",
+  "updated_at": "2026-09-14T14:54:15.078979Z",
+  "task_spec": {
+    "containers": [
+      {
+        "env": [
+          {
+            "name": "GCP_PROJECT",
+            "value": "fxr-analytics"
+          },
+          {
+            "name": "BQ_DATASET",
+            "value": "product_analytics"
+          },
+          {
+            "name": "BQ_TABLE",
+            "value": "weekly_user_activity_with_commitment"
+          },
+          {
+            "name": "COUNTRY_BQ_DATASET",
+            "value": "dbt_cloud"
+          },
+          {
+            "name": "COUNTRY_BQ_TABLE",
+            "value": "dim_user"
+          },
+          {
+            "name": "BQ_WEEK_START_FIELD",
+            "value": "week_start"
+          },
+          {
+            "name": "BQ_WEEK_END_FIELD",
+            "value": "week_end"
+          },
+          {
+            "name": "USER_ID_FIELD",
+            "value": "user_id"
+          },
+          {
+            "name": "EVENT_NAME_FIELD",
+            "value": "event_name"
+          },
+          {
+            "name": "EVENT_TIMESTAMP_FIELD",
+            "value": "event_timestamp"
+          },
+          {
+            "name": "APPCUES_BASE_URL",
+            "value": "https://api.appcues.com"
+          },
+          {
+            "name": "APPCUES_EVENT_NAME",
+            "value": "weekly_product_activity"
+          },
+          {
+            "name": "WINDOW_TIME_ZONE",
+            "value": "America/Chicago"
+          },
+          {
+            "name": "BACKFILL_START_WEEK"
+          },
+          {
+            "name": "BACKFILL_END_WEEK"
+          },
+          {
+            "name": "REQUEST_TIMEOUT_SECONDS",
+            "value": "30"
+          },
+          {
+            "name": "MAX_RETRIES",
+            "value": "5"
+          },
+          {
+            "name": "BASE_RETRY_DELAY_SECONDS",
+            "value": "2"
+          },
+          {
+            "name": "APPCUES_JOB_POLL_SECONDS",
+            "value": "5"
+          },
+          {
+            "name": "APPCUES_JOB_TIMEOUT_SECONDS",
+            "value": "1800"
+          },
+          {
+            "name": "APPCUES_IMPORT_CHUNK_BYTES",
+            "value": "18000000"
+          },
+          {
+            "name": "SKIP_EXISTING_EVENTS",
+            "value": "true"
+          },
+          {
+            "name": "SYNC_COUNTRY_PROFILES",
+            "value": "true"
+          },
+          {
+            "name": "COUNTRY_PROFILE_BACKFILL_ONLY",
+            "value": "false"
+          },
+          {
+            "name": "DRY_RUN",
+            "value": "false"
+          },
+          {
+            "name": "FAIL_ON_PARTIAL_ERRORS",
+            "value": "true"
+          },
+          {
+            "name": "APPCUES_ACCOUNT_ID",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-account-id-runtime"
+              }
+            }
+          },
+          {
+            "name": "APPCUES_API_KEY",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-api-key-runtime"
+              }
+            }
+          },
+          {
+            "name": "APPCUES_API_SECRET",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-api-secret-runtime"
+              }
+            }
+          }
+        ],
+        "image": "us-central1-docker.pkg.dev/fxr-analytics/data-engineering/send-weekly-activity-to-appcues:latest",
+        "resources": {
+          "limits": {
+            "cpu": "1000m",
+            "memory": "2Gi"
+          }
+        }
+      }
+    ],
+    "maxRetries": 0,
+    "serviceAccountName": "362612879927-compute@developer.gserviceaccount.com",
+    "timeoutSeconds": "3600"
+  },
+  "schedule": {
+    "cron": "0 0 * * 1",
+    "time_zone": "America/Chicago",
+    "state": "ENABLED"
+  },
+  "latest_execution": {
+    "completionStatus": "EXECUTION_SUCCEEDED",
+    "completionTimestamp": "2026-11-16T06:00:46.945831Z",
+    "creationTimestamp": "2026-11-16T06:00:02.911933Z",
+    "name": "send-weekly-activity-to-appcues-q9k5g"
+  }
+}

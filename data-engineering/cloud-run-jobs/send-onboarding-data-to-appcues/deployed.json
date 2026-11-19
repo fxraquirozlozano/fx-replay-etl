@@ -1,0 +1,115 @@
+{
+  "retrieved_on": "2026-11-17",
+  "project": "fxr-analytics",
+  "region": "us-central1",
+  "job": "send-onboarding-data-to-appcues",
+  "updated_at": "2026-09-22T14:44:56.658625Z",
+  "task_spec": {
+    "containers": [
+      {
+        "env": [
+          {
+            "name": "GCP_PROJECT",
+            "value": "fxr-analytics"
+          },
+          {
+            "name": "BQ_LOCATION",
+            "value": "US"
+          },
+          {
+            "name": "BQ_DATASET",
+            "value": "engagement_prod"
+          },
+          {
+            "name": "BQ_TABLE",
+            "value": "onboarding_questionnaire_response"
+          },
+          {
+            "name": "APPCUES_BASE_URL",
+            "value": "https://api.appcues.com"
+          },
+          {
+            "name": "REQUEST_TIMEOUT_SECONDS",
+            "value": "30"
+          },
+          {
+            "name": "MAX_RETRIES",
+            "value": "5"
+          },
+          {
+            "name": "BASE_RETRY_DELAY_SECONDS",
+            "value": "2"
+          },
+          {
+            "name": "APPCUES_JOB_POLL_SECONDS",
+            "value": "5"
+          },
+          {
+            "name": "APPCUES_JOB_TIMEOUT_SECONDS",
+            "value": "1800"
+          },
+          {
+            "name": "APPCUES_IMPORT_CHUNK_BYTES",
+            "value": "18000000"
+          },
+          {
+            "name": "DRY_RUN",
+            "value": "false"
+          },
+          {
+            "name": "FAIL_ON_PARTIAL_ERRORS",
+            "value": "true"
+          },
+          {
+            "name": "APPCUES_ACCOUNT_ID",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-account-id-runtime"
+              }
+            }
+          },
+          {
+            "name": "APPCUES_API_KEY",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-api-key-runtime"
+              }
+            }
+          },
+          {
+            "name": "APPCUES_API_SECRET",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "latest",
+                "name": "appcues-api-secret-runtime"
+              }
+            }
+          }
+        ],
+        "image": "us-central1-docker.pkg.dev/fxr-analytics/data-engineering/send-onboarding-data-to-appcues@sha256:f47e29c3aa9164f9b65834a129b56ebfcf79688eec20fa0544e386730611812e",
+        "resources": {
+          "limits": {
+            "cpu": "1",
+            "memory": "2Gi"
+          }
+        }
+      }
+    ],
+    "maxRetries": 0,
+    "serviceAccountName": "362612879927-compute@developer.gserviceaccount.com",
+    "timeoutSeconds": "3600"
+  },
+  "schedule": {
+    "cron": "15 0 * * 1",
+    "time_zone": "America/Chicago",
+    "state": "ENABLED"
+  },
+  "latest_execution": {
+    "completionStatus": "EXECUTION_SUCCEEDED",
+    "completionTimestamp": "2026-11-16T06:16:38.60063Z",
+    "creationTimestamp": "2026-11-16T06:15:10.996974Z",
+    "name": "send-onboarding-data-to-appcues-7ldmw"
+  }
+}
