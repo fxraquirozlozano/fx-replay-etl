@@ -1,0 +1,137 @@
+{
+  "apiVersion": "run.googleapis.com/v1",
+  "kind": "Job",
+  "metadata": {
+    "annotations": {
+      "run.googleapis.com/client-name": "gcloud",
+      "run.googleapis.com/client-version": "572.0.0",
+      "run.googleapis.com/creator": "juan.godoy@fxreplay.com",
+      "run.googleapis.com/lastModifier": "juan.godoy@fxreplay.com",
+      "run.googleapis.com/operation-id": "289c5f9e-4505-43ad-a404-b011cf7aa5ec"
+    },
+    "creationTimestamp": "2026-11-20T12:29:52.105712Z",
+    "generation": 5,
+    "labels": {
+      "cloud.googleapis.com/location": "us-central1",
+      "run.googleapis.com/lastUpdatedTime": "2026-11-20T18:03:03.293170Z"
+    },
+    "name": "send-user-plan-state-to-appcues",
+    "namespace": "362612879927",
+    "resourceVersion": "AAZguQ4xXEA",
+    "selfLink": "/apis/run.googleapis.com/v1/namespaces/362612879927/jobs/send-user-plan-state-to-appcues",
+    "uid": "042b1090-e837-4ce7-aeef-6c869cb97c11"
+  },
+  "spec": {
+    "template": {
+      "metadata": {
+        "annotations": {
+          "run.googleapis.com/client-name": "gcloud",
+          "run.googleapis.com/client-version": "572.0.0",
+          "run.googleapis.com/execution-environment": "gen2"
+        },
+        "labels": {
+          "client.knative.dev/nonce": "dah_nos_xat"
+        }
+      },
+      "spec": {
+        "parallelism": 1,
+        "taskCount": 1,
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "GCP_PROJECT",
+                    "value": "fxr-analytics"
+                  },
+                  {
+                    "name": "SOURCE_PROJECT",
+                    "value": "fxr-analytics"
+                  },
+                  {
+                    "name": "SYNC_DATASET",
+                    "value": "appcues_sync"
+                  },
+                  {
+                    "name": "BQ_LOCATION",
+                    "value": "US"
+                  },
+                  {
+                    "name": "RUN_MODE",
+                    "value": "auto"
+                  },
+                  {
+                    "name": "DRY_RUN",
+                    "value": "false"
+                  },
+                  {
+                    "name": "APPCUES_MAX_PROFILES",
+                    "value": "0"
+                  },
+                  {
+                    "name": "APPCUES_JOB_TIMEOUT_SECONDS",
+                    "value": "1800"
+                  },
+                  {
+                    "name": "APPCUES_ACCOUNT_ID",
+                    "valueFrom": {
+                      "secretKeyRef": {
+                        "key": "latest",
+                        "name": "appcues-account-id-runtime"
+                      }
+                    }
+                  },
+                  {
+                    "name": "APPCUES_API_KEY",
+                    "valueFrom": {
+                      "secretKeyRef": {
+                        "key": "latest",
+                        "name": "appcues-api-key-runtime"
+                      }
+                    }
+                  },
+                  {
+                    "name": "APPCUES_API_SECRET",
+                    "valueFrom": {
+                      "secretKeyRef": {
+                        "key": "latest",
+                        "name": "appcues-api-secret-runtime"
+                      }
+                    }
+                  }
+                ],
+                "image": "us-central1-docker.pkg.dev/fxr-analytics/data-engineering/send-user-plan-state-to-appcues@sha256:3ea8816ef7e3d8e5f0a3173ae045e5f82d218f92ce4d5f10551cb83d4002d341",
+                "resources": {
+                  "limits": {
+                    "cpu": "1",
+                    "memory": "2Gi"
+                  }
+                }
+              }
+            ],
+            "maxRetries": 0,
+            "serviceAccountName": "362612879927-compute@developer.gserviceaccount.com",
+            "timeoutSeconds": "21600"
+          }
+        }
+      }
+    }
+  },
+  "status": {
+    "conditions": [
+      {
+        "status": "True",
+        "type": "Ready"
+      }
+    ],
+    "executionCount": 2,
+    "latestCreatedExecution": {
+      "completionStatus": "EXECUTION_SUCCEEDED",
+      "completionTimestamp": "2026-11-20T12:55:43.477773Z",
+      "creationTimestamp": "2026-11-20T12:53:19.778855Z",
+      "name": "send-user-plan-state-to-appcues-kjs22"
+    },
+    "observedGeneration": 5
+  }
+}
